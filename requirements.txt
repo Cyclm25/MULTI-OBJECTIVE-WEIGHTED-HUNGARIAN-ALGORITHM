@@ -1,0 +1,9 @@
+numpy
+pandas
+scipy
+matplotlib
+flasknumpy>=1.19.0
+pandas>=1.1.0
+scipy>=1.5.0
+matplotlib>=3.2.0
+flask>=1.1.2
