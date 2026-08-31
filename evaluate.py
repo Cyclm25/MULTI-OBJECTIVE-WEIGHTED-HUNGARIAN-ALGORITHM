@@ -11,7 +11,7 @@ import os
 import matplotlib.pyplot as plt
 from scipy.stats import spearmanr
 
-from data_generator import generate_households, generate_resources
+from data_generator import generate_households, generate_resources, generate_masterlist
 from validation import validate_households
 from cost_matrix import build_cost_matrix, DEFAULT_WEIGHTS, urgency_score
 from standard_solver import solve_distance_only
@@ -31,14 +31,12 @@ def make_distance_matrix(households: pd.DataFrame, resources: pd.DataFrame, seed
 def run_once(n: int, seed: int = 0) -> Dict:
     households = generate_households(n, seed=seed)
     resources = generate_resources(n, seed=seed)
-    master = generate_households(n, seed=seed)  # simple masterlist
+    master = generate_masterlist(households)
     validated = validate_households(households, master)
-    # use only Verified or Pending for simulation (H* per spec is Verified only,
-    # but Pending allows some test variability) -> use Verified
+    # H* contains verified beneficiaries only, as defined in the methodology.
     Hstar = validated[validated["verification_status"] == "Verified"]
-    # if none verified, fall back to all households
-    if len(Hstar) < n:
-        Hstar = households
+    if Hstar.empty:
+        raise ValueError("No verified households available for allocation")
 
     # distance matrix
     dmat = make_distance_matrix(Hstar, resources, seed=seed)

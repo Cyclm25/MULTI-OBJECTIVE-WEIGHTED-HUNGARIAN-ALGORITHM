@@ -44,33 +44,40 @@ def selective_reassign(mapping: Dict[int, int], cost_matrix: np.ndarray, affecte
 
 def run_dynamic_assignment(households, resources, cost_matrix: np.ndarray,
                            urgency_series: List[float], events: int = 5,
-                           delta_threshold: float = 2.0, seed: int = 0) -> Dict:
+                           delta_threshold: float = 2.0, seed: int = 0,
+                           urgency_weight: float = 0.539) -> Dict:
     """Run initial assignment then simulate urgency fluctuation events.
 
     - urgency_series: initial urgencies (list length n)
     - On each event, perturb urgencies; if |Δ| >= threshold, selectively update mapping.
     Returns final mapping, event log, and timing.
     """
-    import random
-    random.seed(seed)
+    rng = np.random.default_rng(seed)
     n = len(households)
-    mapping, t_init = initial_assignment(cost_matrix)
+    working_cost = np.array(cost_matrix, dtype=float, copy=True)
+    mapping, t_init = initial_assignment(working_cost)
     timings = {"initial_s": t_init, "events": []}
     urg_prev = np.array(urgency_series, dtype=float)
 
     for e in range(events):
         # perturb some urgencies
-        noise = np.random.normal(loc=0.0, scale=5.0, size=n)
+        noise = rng.normal(loc=0.0, scale=5.0, size=n)
         urg_new = np.clip(urg_prev + noise, 0.0, 100.0)
         delta = np.abs(urg_new - urg_prev)
         affected = [int(i) for i, d in enumerate(delta) if d >= delta_threshold]
 
         if affected:
-            mapping, t_re = selective_reassign(mapping, cost_matrix, affected)
+            # Update only affected urgency rows before solving their reduced
+            # assignment sub-problem, as specified by the selective mechanism.
+            old_cost = 1.0 - (urg_prev / 100.0)
+            new_cost = 1.0 - (urg_new / 100.0)
+            for row in affected:
+                working_cost[row, :] += urgency_weight * (new_cost[row] - old_cost[row])
+            mapping, t_re = selective_reassign(mapping, working_cost, affected)
         else:
             t_re = 0.0
 
         timings["events"].append({"event": e + 1, "affected": affected, "time_s": t_re})
         urg_prev = urg_new
 
-    return {"mapping": mapping, "timings": timings}
+    return {"mapping": mapping, "timings": timings, "final_cost_matrix": working_cost}

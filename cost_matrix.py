@@ -98,7 +98,9 @@ def build_cost_matrix(households: pd.DataFrame, resources: pd.DataFrame, distanc
     dist_n = normalize_array(np.array(distance_matrix, dtype=float))
     urg_n = normalize_array(urgencies)
     # expand urgencies to matrix rows
-    urg_mat = np.repeat(urg_n.reshape((n, 1)), n, axis=1)
+    # Hungarian minimizes cost, so a more urgent household must have a lower
+    # urgency-cost value. This implements "maximize urgency prioritization".
+    urg_mat = np.repeat((1.0 - urg_n).reshape((n, 1)), n, axis=1)
     comp_n = comp  # compatibility already 0..1
 
     C = w1 * dist_n + w2 * urg_mat + w3 * (1.0 - comp_n)
