@@ -13,7 +13,7 @@ from scipy.stats import spearmanr
 
 from data_generator import generate_households, generate_resources, generate_masterlist
 from validation import validate_households
-from cost_matrix import build_cost_matrix, DEFAULT_WEIGHTS, urgency_score
+from cost_matrix import build_cost_matrix, build_existing_cost_matrix, DEFAULT_WEIGHTS, urgency_score
 from standard_solver import solve_distance_only
 from enhanced_solver import run_dynamic_assignment
 
@@ -41,12 +41,15 @@ def run_once(n: int, seed: int = 0) -> Dict:
     # distance matrix
     dmat = make_distance_matrix(Hstar, resources, seed=seed)
 
-    # build cost matrix (multi-objective)
+    # Standard Hungarian baseline cost matrix: distance only.
+    C_existing = build_existing_cost_matrix(dmat)
+
+    # Enhanced cost matrix: distance + urgency + compatibility.
     C = build_cost_matrix(Hstar.reset_index(drop=True), resources.reset_index(drop=True), dmat)
 
     # baseline (distance only)
     t0 = time.perf_counter()
-    res_base = solve_distance_only(dmat)
+    res_base = solve_distance_only(C_existing)
     t1 = time.perf_counter()
     base_time = res_base.get("time_s", t1 - t0)
     base_map = res_base["mapping"]
@@ -61,7 +64,7 @@ def run_once(n: int, seed: int = 0) -> Dict:
     def total_cost(mapping, mat):
         return float(sum(mat[r, c] for r, c in mapping.items()))
 
-    base_cost = total_cost(base_map, dmat)
+    base_cost = total_cost(base_map, C_existing)
     enh_cost = total_cost(enh_map, C)
 
     # allocation accuracy: fraction assigned pack_type in household needs

@@ -11,6 +11,9 @@ import time
 def solve_distance_only(distance_matrix: np.ndarray) -> Dict[int, int]:
     """Solve assignment using only the distance matrix as cost.
 
+    The caller must pass a distance-only matrix. This function does not use
+    urgency, compatibility, priority, vulnerability, or AHP weights.
+
     Returns a mapping row->col (household index -> resource index) and timing info.
     """
     t0 = time.perf_counter()

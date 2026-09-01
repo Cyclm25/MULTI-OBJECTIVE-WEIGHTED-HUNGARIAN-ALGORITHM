@@ -73,6 +73,16 @@ def normalize_array(arr: np.ndarray) -> np.ndarray:
     return (arr - mn) / (mx - mn)
 
 
+def build_existing_cost_matrix(distance_matrix: np.ndarray) -> np.ndarray:
+    """Return the Standard Hungarian baseline cost matrix.
+
+    The baseline is intentionally distance only. Stable input ordering handles
+    equal-distance ties; urgency, priority, vulnerability, AHP weights, and
+    resource compatibility are not inspected here.
+    """
+    return np.array(distance_matrix, dtype=float, copy=True)
+
+
 def build_cost_matrix(households: pd.DataFrame, resources: pd.DataFrame, distance_matrix: np.ndarray,
                       w1: float = None, w2: float = None, w3: float = None) -> np.ndarray:
     """Construct the weighted cost matrix C for n households and n resources.
