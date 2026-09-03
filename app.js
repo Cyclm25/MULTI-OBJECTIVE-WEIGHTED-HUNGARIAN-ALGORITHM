@@ -2,7 +2,9 @@ const resources = ['Relief-01', 'Relief-02', 'Relief-03', 'Relief-04', 'Relief-0
 const resourceTypes = ['Water', 'Food', 'Medical', 'Shelter'];
 function deriveAHPWeights() { const matrix = [[1, 1 / 3, 1 / 2], [3, 1, 2], [2, 1 / 2, 1]]; const geometricMeans = matrix.map(row => Math.pow(row.reduce((product, value) => product * value, 1), 1 / row.length)); const total = geometricMeans.reduce((sum, value) => sum + value, 0); return { distance: geometricMeans[0] / total, urgency: geometricMeans[1] / total, compatibility: geometricMeans[2] / total }; }
 const DEBUG_ALGORITHM_DIAGNOSTICS = false;
-const GEOCODE_CACHE_KEY = 'allocation-geocode-cache-v1';
+// Bump this key whenever geocoding rules change so stale, unconstrained matches
+// cannot silently re-enter the Barangay 160 dataset.
+const GEOCODE_CACHE_KEY = 'allocation-geocode-cache-v2';
 const RESEARCH_CONFIG = {
   areaName: 'Barangay 160',
   geocodingContext: 'Tondo, Manila, Metro Manila, Philippines',
@@ -18,7 +20,7 @@ const RESEARCH_CONFIG = {
   },
   locationReview: {
     reviewBufferKm: 0.75,
-    enforceBoundaryForEligibility: false
+    enforceBoundaryForEligibility: true
   },
   geocoding: {
     provider: 'Nominatim',
@@ -705,16 +707,23 @@ async function geocodeAddress(address) {
   if (typeof fetch !== 'function') return { status: 'Unresolved', reason: 'Geocoding service unavailable' };
   await waitForGeocoderSlot();
   try {
+    const limits = getResearchAreaLimits();
     const params = new URLSearchParams({ format: 'jsonv2', q: query, limit: '1', addressdetails: '1' });
+    if (limits) {
+      // Nominatim viewbox order is left,top,right,bottom (lon,lat,lon,lat).
+      params.set('viewbox', `${limits.minLon},${limits.maxLat},${limits.maxLon},${limits.minLat}`);
+      params.set('bounded', '1');
+    }
     const response = await fetch(`${RESEARCH_CONFIG.geocoding.endpoint}?${params.toString()}`, { headers: { Accept: 'application/json' } });
     if (!response.ok) throw new Error('geocoder response failed');
     const results = await response.json();
     const match = Array.isArray(results) ? results[0] : null;
     const lat = parseCoordinate(match?.lat);
     const lon = parseCoordinate(match?.lon);
-    const resolved = Number.isFinite(lat) && Number.isFinite(lon)
+    const insideResearchArea = Number.isFinite(lat) && Number.isFinite(lon) && isInsideResearchArea(lat, lon);
+    const resolved = insideResearchArea
       ? { status: classifyGeocodeResult(match), latitude: lat, longitude: lon, displayName: match.display_name || '', provider: RESEARCH_CONFIG.geocoding.provider }
-      : { status: 'Unresolved' };
+      : { status: 'Unresolved', reason: 'No location found inside Barangay 160' };
     state.geocodeCache[query] = resolved;
     writeGeocodeCache();
     return resolved;
@@ -1691,6 +1700,7 @@ const goWithMapRefresh = go;
 go = function (page) {
   if (window.expandedAssignmentMap && window.expandedAssignmentMap !== page) setAssignmentMapExpanded(window.expandedAssignmentMap, false);
   goWithMapRefresh(page);
+  if (page === 'compare') renderComparisonMaps();
   setTimeout(refreshAllLeafletMaps, 0);
   setTimeout(refreshAllLeafletMaps, 180);
 };
@@ -1703,7 +1713,7 @@ document.addEventListener('keydown', event => {
 });
 
 function renderComparisonMaps() {
-  if (typeof L === 'undefined' || !state.results.existing || !state.results.enhanced) return;
+  if (typeof L === 'undefined') return;
   let panel = $('#comparison-map-panel');
   if (!panel) {
     panel = document.createElement('section');
@@ -1712,7 +1722,7 @@ function renderComparisonMaps() {
     panel.innerHTML = `<div class="panel-head"><div><p class="eyebrow">Geographic comparison</p><h3>Standard distance baseline vs enhanced weighted model</h3></div></div><div class="comparison-map-grid"><div><div class="comparison-map-head"><h4>Standard Hungarian · distance only</h4><div class="map-legend" aria-label="Standard distance-only legend">${EXISTING_MAP_LEGEND}</div></div><div id="compare-existing-map" class="relief-map"></div></div><div><div class="comparison-map-head"><h4>Enhanced Hungarian · distance + urgency + compatibility</h4><div class="map-legend" aria-label="Enhanced priority legend">${MAP_LEGEND}</div></div><div id="compare-enhanced-map" class="relief-map"></div></div></div><div class="map-foot"><span>Click a household marker to inspect its assignment. Lines are not routes.</span><strong>Same Barangay 160 research area</strong></div>`;
     $('#view-compare').insertBefore(panel, $('#compare-content'));
   }
-  ['existing', 'enhanced'].forEach(target => renderComparisonMap(state.results[target], target));
+  ['existing', 'enhanced'].forEach(target => renderComparisonMap(state.results[target] || null, target));
 }
 
 function renderComparisonMap(result, target) {
@@ -1730,10 +1740,14 @@ function renderComparisonMap(result, target) {
   const boundaryLayer = addResearchBoundaryLayer(map);
   if (boundaryLayer) window.comparisonMapLayers[target].push(boundaryLayer);
   hideHouseholdInfoCard(map, true);
-  getAssignmentMapItems(result).forEach(item => {
+  const mapItems = result
+    ? getAssignmentMapItems(result)
+    : state.dataset.map(household => ({ household, assigned: false, assignmentStatus: 'Not yet assigned' }));
+  mapItems.forEach(item => {
     const lat = Number(item.household.latitude);
     const lon = Number(item.household.longitude);
-    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+    // Comparison maps always stay scoped to the configured Barangay 160 area.
+    if (!Number.isFinite(lat) || !Number.isFinite(lon) || !isInsideResearchArea(lat, lon)) return;
     const point = [lat, lon];
     const { color } = getUrgencyMeta(item.household.urgency);
     const hubDistance = geoDistanceKm(hub, point).toFixed(2);

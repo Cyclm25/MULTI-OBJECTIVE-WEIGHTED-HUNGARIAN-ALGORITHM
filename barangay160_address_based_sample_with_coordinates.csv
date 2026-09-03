@@ -1,0 +1,16 @@
+household,address,latitude,longitude,urgency,compatible_resource,verification,coordinate_source
+H-001,"Raxabago Street near Dagupan Extension, Barangay 160, Zone 14, Tondo, Manila",14.62018,120.97298,9,Water,Verified,Synthetic sample point
+H-002,"Dagupan Street near Dagupan Extension, Barangay 160, Zone 14, Tondo, Manila",14.62027,120.97308,4,Food,Verified,Synthetic sample point
+H-003,"Trinidad Street near Dagupan Extension, Barangay 160, Zone 14, Tondo, Manila",14.62036,120.97318,8,Water,Verified,Synthetic sample point
+H-004,"F. Yuseco Street near Barangay 160 Hall, Tondo, Manila",14.62045,120.97328,2,Medical,Verified,Synthetic sample point
+H-005,"Raxabago Street near Barangay 160 Hall, Tondo, Manila",14.62054,120.97338,7,Food,Pending,Synthetic sample point
+H-006,"F. Yuseco Street near Old Torres Covered Court, Tondo, Manila",14.62063,120.97348,6,Water,Verified,Synthetic sample point
+H-007,"Raxabago Street near Old Torres Covered Court, Tondo, Manila",14.62072,120.97358,3,Shelter,Verified,Synthetic sample point
+H-008,"Dagupan Street near F. Yuseco Street, Barangay 160, Tondo, Manila",14.62081,120.97368,10,Medical,Verified,Synthetic sample point
+H-009,"Trinidad Street near Raxabago Street, Barangay 160, Zone 14, Tondo, Manila",14.62090,120.97378,5,Food,Verified,Synthetic sample point
+H-010,"Dagupan Extension near Raxabago Street, Barangay 160, Zone 14, Tondo, Manila",14.62099,120.97388,8,Shelter,Pending,Synthetic sample point
+H-011,"Dagupan Extension near Trinidad Street, Barangay 160, Zone 14, Tondo, Manila",14.62108,120.97398,1,Water,Verified,Synthetic sample point
+H-012,"F. Yuseco Street near Salas Kainan, Tondo, Manila",14.62117,120.97402,9,Medical,Verified,Synthetic sample point
+H-013,"Raxabago Street near Kambal na Krus Chapel, Tondo, Manila",14.62126,120.97392,6,Food,Verified,Synthetic sample point
+H-014,"Raxabago Street near Dagupan Street, Barangay 160, Zone 14, Tondo, Manila",14.62135,120.97382,7,Shelter,Verified,Synthetic sample point
+H-015,"Trinidad Street near Dagupan Street, Barangay 160, Zone 14, Tondo, Manila",14.62144,120.97372,3,Water,Pending,Synthetic sample point

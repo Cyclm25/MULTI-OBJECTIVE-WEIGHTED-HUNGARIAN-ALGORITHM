@@ -1,16 +1,16 @@
-household,address,urgency,compatible_resource,verification,latitude,longitude
-H-001,"Raxabago Street near Dagupan Extension, Barangay 160, Tondo, Manila",9,Water,Verified,14.62018,120.97298
-H-002,"Dagupan Extension, Barangay 160, Tondo, Manila",4,Food,Verified,14.62027,120.97308
-H-003,"Raxabago Street, Barangay 160, Tondo, Manila",8,Water,Verified,14.62036,120.97318
-H-004,"Capulong Street, Barangay 160, Tondo, Manila",2,Medical,Verified,14.62045,120.97328
-H-005,"Herbosa Street, Barangay 160, Tondo, Manila",7,Food,Pending,14.62054,120.97338
-H-006,"Moriones Street, Barangay 160, Tondo, Manila",6,Water,Verified,14.62063,120.97348
-H-007,"Velasquez Street, Barangay 160, Tondo, Manila",3,Shelter,Verified,14.62072,120.97358
-H-008,"Deca Homes area, Barangay 160, Tondo, Manila",10,Medical,Verified,14.62081,120.97368
-H-009,"Dagupan Street corner Raxabago, Barangay 160, Tondo, Manila",5,Food,Verified,14.62090,120.97378
-H-010,"Raxabago Extension, Barangay 160, Tondo, Manila",8,Shelter,Pending,14.62099,120.97388
-H-011,"Residential area near Raxabago, Barangay 160, Tondo, Manila",1,Water,Verified,14.62108,120.97398
-H-012,"Residential area near Dagupan Extension, Barangay 160, Tondo, Manila",9,Medical,Verified,14.62117,120.97402
-H-013,"Herbosa residential lane, Barangay 160, Tondo, Manila",6,Food,Verified,14.62126,120.97392
-H-014,"Moriones residential lane, Barangay 160, Tondo, Manila",7,Shelter,Verified,14.62135,120.97382
-H-015,"Raxabago neighborhood, Barangay 160, Tondo, Manila",3,Water,Pending,14.62144,120.97372
+household_id,latitude,longitude,urgency,compatible_resource,verification
+H-001,14.62018,120.97298,9,Water,Verified
+H-002,14.62027,120.97308,4,Food,Verified
+H-003,14.62036,120.97318,8,Water,Verified
+H-004,14.62045,120.97328,2,Medical,Verified
+H-005,14.62054,120.97338,7,Food,Pending
+H-006,14.62063,120.97348,6,Water,Verified
+H-007,14.62072,120.97358,3,Shelter,Verified
+H-008,14.62081,120.97368,10,Medical,Verified
+H-009,14.62090,120.97378,5,Food,Verified
+H-010,14.62099,120.97388,8,Shelter,Pending
+H-011,14.62108,120.97398,1,Water,Verified
+H-012,14.62117,120.97402,9,Medical,Verified
+H-013,14.62126,120.97392,6,Food,Verified
+H-014,14.62135,120.97382,7,Shelter,Verified
+H-015,14.62144,120.97372,3,Water,Pending

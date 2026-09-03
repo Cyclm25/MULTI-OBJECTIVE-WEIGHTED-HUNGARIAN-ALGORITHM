@@ -20,3 +20,13 @@ Algorithm methodology:
 - Enhanced Hungarian: distance + urgency + resource compatibility using the fixed research weights.
 
 Beneficiary verification and data validation are proposed-system preprocessing features that derive the verified household set H*. The Standard Hungarian baseline itself assumes accurate input, but for controlled comparison both Standard and Enhanced runs receive the same H*. Verification is not an optimization weight. Pending households can remain visible on maps but are not included in algorithm assignment until verified.
+
+## Coordinate-enabled demonstration data
+
+Run `python data_generator.py` to create `barangay160_generated_sample.csv`, a
+15-household file that can be uploaded directly to Allocation Lab. Its
+coordinates are synthetic points constrained to the configured Barangay 160
+boundary and are intended only for demonstrations. Real household records
+should use field-collected GPS coordinates. Missing coordinates may be
+geocoded, but unresolved or out-of-boundary results require manual review and
+are excluded from allocation.

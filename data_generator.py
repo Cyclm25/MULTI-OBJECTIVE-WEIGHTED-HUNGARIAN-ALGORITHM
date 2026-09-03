@@ -10,6 +10,17 @@ import pandas as pd
 
 PACK_TYPES = ["food", "hygiene", "medical", "infant", "mobility"]
 
+# The web application's configured Barangay 160 review boundary. Coordinates
+# generated from this box are synthetic demonstration points, not surveyed
+# household locations.
+BARANGAY_160_BOUNDS = {
+    "min_lat": 14.6200279,
+    "max_lat": 14.6214747,
+    "min_lon": 120.9729135,
+    "max_lon": 120.9740792,
+}
+RELIEF_TYPES = ["Water", "Food", "Medical", "Shelter"]
+
 
 def generate_households(n: int, seed: int = 0) -> pd.DataFrame:
     """Generate n synthetic household records.
@@ -65,3 +76,50 @@ def generate_masterlist(households: pd.DataFrame) -> pd.DataFrame:
     df = households.copy()
     df["master_household_id"] = df["household_id"]
     return df[["master_household_id", "name", "address"]]
+
+
+def generate_barangay160_web_sample(n: int = 15, seed: int = 160) -> pd.DataFrame:
+    """Generate coordinate-enabled sample rows accepted by Allocation Lab.
+
+    The coordinates are reproducible synthetic points strictly inside the
+    configured Barangay 160 boundary. They must not be used as real household
+    locations or substituted for field-collected GPS data.
+    """
+    if n < 1:
+        raise ValueError("n must be at least 1")
+
+    rng = random.Random(seed)
+    bounds = BARANGAY_160_BOUNDS
+    lat_margin = (bounds["max_lat"] - bounds["min_lat"]) * 0.08
+    lon_margin = (bounds["max_lon"] - bounds["min_lon"]) * 0.08
+    addresses = [
+        "F. Yuseco Street, Barangay 160, Tondo, Manila",
+        "Near Barangay 160 Hall, Tondo, Manila",
+        "Barangay 160, Zone 14, Tondo, Manila",
+    ]
+
+    rows = []
+    for index in range(n):
+        rows.append({
+            "household": f"H-{index + 1:03d}",
+            "address": addresses[index % len(addresses)],
+            "latitude": round(rng.uniform(
+                bounds["min_lat"] + lat_margin,
+                bounds["max_lat"] - lat_margin,
+            ), 7),
+            "longitude": round(rng.uniform(
+                bounds["min_lon"] + lon_margin,
+                bounds["max_lon"] - lon_margin,
+            ), 7),
+            "urgency": rng.randint(1, 10),
+            "compatible_resource": RELIEF_TYPES[index % len(RELIEF_TYPES)],
+            "verification": "Pending" if (index + 1) % 5 == 0 else "Verified",
+            "coordinate_source": "Synthetic sample point",
+        })
+    return pd.DataFrame(rows)
+
+
+if __name__ == "__main__":
+    output_path = "barangay160_generated_sample.csv"
+    generate_barangay160_web_sample().to_csv(output_path, index=False)
+    print(f"Created {output_path} with synthetic Barangay 160 coordinates")
