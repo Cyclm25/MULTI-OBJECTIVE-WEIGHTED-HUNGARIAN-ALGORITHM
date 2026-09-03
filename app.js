@@ -9,8 +9,16 @@ const RESEARCH_CONFIG = {
   hub: {
     name: 'Barangay 160, Tondo, Manila',
     address: 'Barangay 160 Barangay Hall, Tondo, Manila, Metro Manila, Philippines',
-    coordinates: [14.6207513, 120.97349635],
+    coordinates: [14.6207513, 120.97349635]
+  },
+  researchArea: {
+    name: 'Configured Barangay 160 review boundary',
+    type: 'bbox',
     bounds: [[14.6200279, 120.9729135], [14.6214747, 120.9740792]]
+  },
+  locationReview: {
+    reviewBufferKm: 0.75,
+    enforceBoundaryForEligibility: false
   },
   geocoding: {
     provider: 'Nominatim',
@@ -18,24 +26,54 @@ const RESEARCH_CONFIG = {
     requestDelayMs: 1100
   }
 };
-const state = { rawRows: [], rawHeaders: [], columnMapping: {}, mappingIssues: [], dataset: [], researchDataset: [], invalidRows: [], validation: null, filename: '', latest: null, results: {}, history: JSON.parse(localStorage.getItem('allocation-history') || '[]'), weights: deriveAHPWeights(), geocodeCache: JSON.parse(localStorage.getItem(GEOCODE_CACHE_KEY) || '{}'), processing: false };
-const RELIEF_HUB = { name: RESEARCH_CONFIG.hub.name, address: RESEARCH_CONFIG.hub.address, coordinates: [...RESEARCH_CONFIG.hub.coordinates], bounds: RESEARCH_CONFIG.hub.bounds };
+const state = { rawRows: [], rawHeaders: [], columnMapping: {}, mappingIssues: [], dataset: [], researchDataset: [], verifiedHouseholdSet: [], invalidRows: [], validation: null, filename: '', latest: null, results: {}, history: JSON.parse(localStorage.getItem('allocation-history') || '[]'), weights: deriveAHPWeights(), geocodeCache: JSON.parse(localStorage.getItem(GEOCODE_CACHE_KEY) || '{}'), processing: false };
+const RELIEF_HUB = { name: RESEARCH_CONFIG.hub.name, address: RESEARCH_CONFIG.hub.address, coordinates: [...RESEARCH_CONFIG.hub.coordinates], bounds: RESEARCH_CONFIG.researchArea.bounds };
 const MAP_ZOOM = 17;
 const MAP_TILES = 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
 const MAP_ATTRIBUTION = '&copy; OpenStreetMap contributors';
 let hubIcon;
+function scheduleMapInvalidate(map) {
+  if (!map?.invalidateSize) return;
+  const resize = () => {
+    const container = map.getContainer?.();
+    if (!container || !container.clientWidth || !container.clientHeight) return;
+    map.invalidateSize({ pan: false });
+  };
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(resize);
+  setTimeout(resize, 0);
+  setTimeout(resize, 120);
+  setTimeout(resize, 320);
+}
+function safeFitMapBounds(map, points, options = {}) {
+  const validPoints = points.filter(point => Array.isArray(point) && point.length >= 2 && Number.isFinite(Number(point[0])) && Number.isFinite(Number(point[1])));
+  if (validPoints.length > 1) map.fitBounds(validPoints, { padding: [42, 42], maxZoom: MAP_ZOOM, ...options });
+  else if (validPoints.length === 1) map.setView(validPoints[0], MAP_ZOOM, { animate: false });
+  else map.setView(RELIEF_HUB.coordinates, MAP_ZOOM, { animate: false });
+  scheduleMapInvalidate(map);
+}
 function createReliefMap(elementId) {
   const map = L.map(elementId, {
     center: RELIEF_HUB.coordinates,
     zoom: MAP_ZOOM,
     zoomControl: false,
     scrollWheelZoom: false,
-    maxBounds: RELIEF_HUB.bounds || undefined,
-    maxBoundsViscosity: 1,
     preferCanvas: true
   });
   L.control.zoom({ position: 'bottomright' }).addTo(map);
-  L.tileLayer(MAP_TILES, { attribution: MAP_ATTRIBUTION, maxZoom: 20 }).addTo(map);
+  const tiles = L.tileLayer(MAP_TILES, {
+    attribution: MAP_ATTRIBUTION,
+    maxZoom: 20,
+    detectRetina: true,
+    updateWhenIdle: true,
+    keepBuffer: 3,
+    crossOrigin: true
+  }).addTo(map);
+  tiles.on('tileerror', () => {
+    if (map._tileErrorReported || typeof console === 'undefined') return;
+    map._tileErrorReported = true;
+    console.warn('[Leaflet] OpenStreetMap tiles failed to load. Check network access or tile-provider availability.');
+  });
+  map.whenReady(() => scheduleMapInvalidate(map));
   return map;
 }
 function addHubMarker(map, popupTitle = 'Relief distribution hub') {
@@ -58,9 +96,101 @@ function getUrgencyMeta(value) {
 }
 const MAP_LEGEND = '<span class="map-legend-item"><i class="hub-dot"></i>Hub</span><span class="map-legend-item"><i class="immediate-dot"></i>Immediate (7–10)</span><span class="map-legend-item"><i class="priority-dot"></i>Priority (4–6)</span><span class="map-legend-item"><i class="routine-dot"></i>Routine (0–3)</span>';
 const EXISTING_MAP_LEGEND = '<span class="map-legend-item"><i class="hub-dot"></i>Distribution Hub</span><span class="map-legend-item"><i class="household-dot"></i>Household</span><span class="map-legend-item"><i class="assignment-line"></i>Distance-based assignment</span><span class="map-legend-item"><i class="unassigned-dot"></i>Unassigned Household</span><span class="map-legend-item"><i class="pending-dot"></i>Pending Verification</span>';
+function getResearchAreaBounds() {
+  return RESEARCH_CONFIG.researchArea?.bounds || RELIEF_HUB.bounds || null;
+}
+function getResearchAreaLimits() {
+  const bounds = getResearchAreaBounds();
+  if (!Array.isArray(bounds) || bounds.length < 2) return null;
+  const latitudes = bounds.map(point => Number(point?.[0])).filter(Number.isFinite);
+  const longitudes = bounds.map(point => Number(point?.[1])).filter(Number.isFinite);
+  if (!latitudes.length || !longitudes.length) return null;
+  return {
+    minLat: Math.min(...latitudes),
+    maxLat: Math.max(...latitudes),
+    minLon: Math.min(...longitudes),
+    maxLon: Math.max(...longitudes)
+  };
+}
+function getResearchBoundaryPolygon() {
+  const limits = getResearchAreaLimits();
+  if (!limits) return [];
+  const { minLat, maxLat, minLon, maxLon } = limits;
+  return [[minLat, minLon], [minLat, maxLon], [maxLat, maxLon], [maxLat, minLon], [minLat, minLon]];
+}
+function addResearchBoundaryLayer(map) {
+  const polygon = getResearchBoundaryPolygon();
+  if (!polygon.length || typeof L === 'undefined') return null;
+  return L.polygon(polygon, {
+    color: '#29496b',
+    weight: 1.4,
+    opacity: .52,
+    fillColor: '#29496b',
+    fillOpacity: .045,
+    dashArray: '6 5',
+    interactive: false,
+    className: 'research-boundary-layer'
+  }).addTo(map);
+}
 function isInsideResearchArea(lat, lon) {
-  if (!RELIEF_HUB.bounds) return true;
-  return lat >= RELIEF_HUB.bounds[0][0] && lat <= RELIEF_HUB.bounds[1][0] && lon >= RELIEF_HUB.bounds[0][1] && lon <= RELIEF_HUB.bounds[1][1];
+  const limits = getResearchAreaLimits();
+  const latitude = Number(lat);
+  const longitude = Number(lon);
+  if (!limits) return true;
+  // This bbox is stored as Leaflet-style [latitude, longitude], not GeoJSON [longitude, latitude].
+  return latitude >= limits.minLat && latitude <= limits.maxLat && longitude >= limits.minLon && longitude <= limits.maxLon;
+}
+function getResearchAreaDistanceKm(lat, lon) {
+  const limits = getResearchAreaLimits();
+  const latitude = Number(lat);
+  const longitude = Number(lon);
+  if (!limits || !Number.isFinite(latitude) || !Number.isFinite(longitude)) return null;
+  if (isInsideResearchArea(latitude, longitude)) return 0;
+  const nearestLat = Math.min(Math.max(latitude, limits.minLat), limits.maxLat);
+  const nearestLon = Math.min(Math.max(longitude, limits.minLon), limits.maxLon);
+  return geoDistanceKm([latitude, longitude], [nearestLat, nearestLon]);
+}
+function getLocationReviewBufferKm() {
+  const value = Number(RESEARCH_CONFIG.locationReview?.reviewBufferKm);
+  return Number.isFinite(value) ? value : 0;
+}
+function isResearchBoundaryEnforced() {
+  return RESEARCH_CONFIG.locationReview?.enforceBoundaryForEligibility === true;
+}
+function isApproximateGeocode(row) {
+  return /approximate/i.test(String(row?.geocoding_status || ''));
+}
+function classifyResearchAreaLocation(row) {
+  const lat = Number(row.latitude);
+  const lon = Number(row.longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+    return { status: 'Unresolved Location', inside: false, review: false, outside: false, distanceKm: null, reason: 'Address could not be resolved to coordinates' };
+  }
+  if (isInsideResearchArea(lat, lon)) {
+    return { status: 'Inside Research Area', inside: true, review: false, outside: false, distanceKm: 0, reason: '' };
+  }
+  const distanceKm = getResearchAreaDistanceKm(lat, lon);
+  const approximate = isApproximateGeocode(row);
+  const nearBoundary = Number.isFinite(distanceKm) && distanceKm <= getLocationReviewBufferKm();
+  const distanceText = Number.isFinite(distanceKm) ? `${distanceKm.toFixed(2)} km` : 'an unknown distance';
+  if (approximate || nearBoundary) {
+    return {
+      status: 'Needs Location Review',
+      inside: false,
+      review: true,
+      outside: false,
+      distanceKm,
+      reason: `${approximate ? 'Approximate geocode' : 'Borderline resolved point'} is ${distanceText} outside the configured review boundary`
+    };
+  }
+  return {
+    status: 'Outside Research Area',
+    inside: false,
+    review: false,
+    outside: true,
+    distanceKm,
+    reason: `Resolved point is ${distanceText} outside the configured review boundary`
+  };
 }
 function isVerified(row) { return String(row.verification_status || row.verification || '').trim().toLowerCase() === 'verified'; }
 function resourceType(index) { return resourceTypes[index % resourceTypes.length]; }
@@ -128,6 +258,7 @@ async function loadFile(file) {
       state.mappingIssues = getMappingIssues(state.columnMapping);
       state.dataset = rows;
       state.researchDataset = [];
+      state.verifiedHouseholdSet = [];
       state.invalidRows = [];
       state.validation = null;
       state.results = {};
@@ -153,7 +284,7 @@ function renderDataset() {
   const validation = state.validation;
   $('#top-dataset').textContent = rows.length ? state.filename : 'No dataset loaded';
   $('#stat-status').textContent = state.processing ? 'Processing' : rows.length ? validation ? 'Ready' : 'Mapping' : 'Waiting';
-  $('#stat-file').textContent = rows.length ? validation ? `${validation.eligibleHouseholds} eligible verified households` : 'Review and validate dataset' : 'Upload a verified household CSV';
+  $('#stat-file').textContent = rows.length ? validation ? `${validation.eligibleHouseholds} households in verified set H*` : 'Review and validate raw dataset' : 'Upload raw Barangay CSV';
   $('#stat-records').textContent = rows.length;
   $('#data-name').textContent = state.filename || '—';
   $('#data-rows').textContent = rows.length;
@@ -163,7 +294,7 @@ function renderDataset() {
   renderColumnMappingPanel();
   renderValidationSummary();
   renderTable();
-  ['#existing-input', '#enhanced-input'].forEach(selector => { if ($(selector)) $(selector).textContent = rows.length ? `${rows.length} records` : 'No dataset'; });
+  ['#existing-input', '#enhanced-input'].forEach(selector => { if ($(selector)) $(selector).textContent = rows.length ? validation ? `${getVerifiedHouseholdSet().length} H* / ${rows.length} raw` : `${rows.length} raw records` : 'No dataset'; });
 }
 function renderTable() {
   const query = ($('#table-search')?.value || '').toLowerCase();
@@ -180,6 +311,10 @@ function hungarian(matrix) { const n = matrix.length, m = matrix[0].length, u = 
 function normalize(values) { const min = Math.min(...values), max = Math.max(...values); return max === min ? values.map(() => 0) : values.map(value => (value - min) / (max - min)); }
 function getActiveResources(rows) {
   return resources.slice(0, Math.min(resources.length, rows.length));
+}
+
+function getVerifiedHouseholdSet() {
+  return state.verifiedHouseholdSet?.length ? state.verifiedHouseholdSet : (state.researchDataset || []);
 }
 
 function buildDistanceMatrix(rows, activeResources) {
@@ -214,7 +349,9 @@ function buildEnhancedCostMatrix(rows, activeResources) {
 }
 
 function makeMatrix(mode) {
-  const rows = state.researchDataset;
+  // Controlled experiment: H* is produced once by system validation, then both
+  // algorithms receive the same household coordinates, hub, and resource order.
+  const rows = getVerifiedHouseholdSet();
   const activeResources = getActiveResources(rows);
   return mode === 'existing'
     ? { ...buildExistingCostMatrix(rows, activeResources), activeResources }
@@ -226,7 +363,7 @@ function logAlgorithmCriteriaDiagnostics(mode, matrix, activeResourceCount) {
   const existing = mode === 'existing';
   console.groupCollapsed(`=== ${existing ? 'EXISTING' : 'ENHANCED'} ALGORITHM ===`);
   console.log(`Criterion: ${existing ? 'DISTANCE ONLY' : 'DISTANCE + URGENCY + COMPATIBILITY'}`);
-  console.log(`Households: ${state.researchDataset.length}`);
+  console.log(`Households: ${getVerifiedHouseholdSet().length}`);
   console.log(`Resources: ${activeResourceCount}`);
   console.log(`Cost matrix shape: ${matrix.length} x ${matrix[0]?.length || 0}`);
   console.table({
@@ -247,14 +384,15 @@ function execute(mode) {
   }
   const started = performance.now();
   const { matrix, components, activeResources } = makeMatrix(mode);
+  const verifiedHouseholds = getVerifiedHouseholdSet();
   logAlgorithmCriteriaDiagnostics(mode, matrix, activeResources.length);
   const assignment = hungarian(matrix);
   const output = assignment.map((householdIndex, resourceIndex) => ({
     resource: `${resources[resourceIndex]} (${resourceType(resourceIndex)})`,
     resourceIndex,
-    household: state.researchDataset[householdIndex],
+    household: verifiedHouseholds[householdIndex],
     value: matrix[resourceIndex][householdIndex],
-    distanceKm: distance(state.researchDataset[householdIndex]),
+    distanceKm: distance(verifiedHouseholds[householdIndex]),
     components: components?.[resourceIndex]?.[householdIndex] || null
   }));
   const cost = output.reduce((sum, item) => sum + item.value, 0);
@@ -266,10 +404,10 @@ function execute(mode) {
   const prioritization = urgent.length ? priorityMatches / urgent.length : 0;
   const meanDistance = output.length ? totalDistance / output.length : 0;
   const maxDistance = output.length ? Math.max(...output.map(item => item.distanceKm)) : 0;
-  const result = { mode, output, cost, totalDistance, meanDistance, maxDistance, priorityMatches, accuracy, prioritization, duration: Math.max(.3, performance.now() - started).toFixed(2), dataset: state.filename, records: state.researchDataset.length };
+  const result = { mode, output, cost, totalDistance, meanDistance, maxDistance, priorityMatches, accuracy, prioritization, duration: Math.max(.3, performance.now() - started).toFixed(2), dataset: state.filename, records: verifiedHouseholds.length };
   state.latest = result;
   state.results[mode] = result;
-  state.history.unshift({ id: `RUN-${String(Date.now()).slice(-5)}`, mode, dataset: state.filename, records: state.researchDataset.length, duration: result.duration, timestamp: new Date().toLocaleString() });
+  state.history.unshift({ id: `RUN-${String(Date.now()).slice(-5)}`, mode, dataset: state.filename, records: verifiedHouseholds.length, duration: result.duration, timestamp: new Date().toLocaleString() });
   state.history = state.history.slice(0, 20);
   localStorage.setItem('allocation-history', JSON.stringify(state.history));
   logAllocationDiagnostics(`${mode} algorithm output`, result);
@@ -351,7 +489,7 @@ function renderReliefMap() {
     panel = document.createElement('section');
     panel.id = 'relief-map-panel';
     panel.className = 'panel map-panel';
-    panel.innerHTML = `<div class="panel-head"><div><p class="eyebrow">Research area</p><h3>${RELIEF_HUB.name} household locations</h3></div><div class="map-legend" aria-label="Household urgency legend">${MAP_LEGEND}</div></div><div id="relief-map" class="relief-map"></div><div class="map-foot"><span>Resolved household locations inside the configured research boundary are shown.</span><strong id="map-count">0 households mapped</strong></div>`;
+    panel.innerHTML = `<div class="panel-head"><div><p class="eyebrow">Research area</p><h3>${RELIEF_HUB.name} household locations</h3></div><div class="map-legend" aria-label="Household urgency legend">${MAP_LEGEND}</div></div><div id="relief-map" class="relief-map"></div><div class="map-foot"><span>Resolved household locations and the configured research boundary are shown.</span><strong id="map-count">0 households mapped</strong></div>`;
     $('#view-dashboard').appendChild(panel);
   }
   if (!window.reliefMap) {
@@ -361,24 +499,22 @@ function renderReliefMap() {
   window.reliefLayers = [];
   const hub = RELIEF_HUB.coordinates;
   window.reliefLayers.push(addHubMarker(window.reliefMap));
+  const boundaryLayer = addResearchBoundaryLayer(window.reliefMap);
+  if (boundaryLayer) window.reliefLayers.push(boundaryLayer);
   const mapped = [];
   state.dataset.forEach(row => {
     const lat = Number(row.latitude);
     const lon = Number(row.longitude);
-    if (!Number.isFinite(lat) || !Number.isFinite(lon) || !isInsideResearchArea(lat, lon)) return;
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
     const point = [lat, lon];
     const { urgency, color, label } = getUrgencyMeta(row.urgency);
-    const markerStyle = isPending(row)
-      ? { radius: 6, color, weight: 2, fillColor: '#fff', fillOpacity: .28, opacity: .72, dashArray: '3 3' }
-      : { radius: 6, color: '#fff', weight: 2, fillColor: color, fillOpacity: .95 };
-    window.reliefLayers.push(L.circleMarker(point, markerStyle).addTo(window.reliefMap).bindPopup(`<strong>${escapeHtml(row.household_id || 'Household')}</strong><br>Verification: ${escapeHtml(row.verification || 'Unknown')}<br>Urgency: ${urgency}/10<br>Location: ${escapeHtml(row.geocoding_status || 'Resolved')}`));
+    const markerStyle = getDatasetMarkerStyle(row, color);
+    window.reliefLayers.push(L.circleMarker(point, markerStyle).addTo(window.reliefMap).bindPopup(`<strong>${escapeHtml(row.household_id || 'Household')}</strong><br>H*: ${escapeHtml(row.verification_status || 'Pending System Validation')}<br>Urgency: ${urgency}/10<br>Geocoding: ${escapeHtml(row.geocoding_status || 'Resolved')}<br>Location: ${escapeHtml(row.location_status || 'Pending Location Check')}`));
     mapped.push(point);
   });
-  const eligible = state.validation ? state.researchDataset.length : 0;
+  const eligible = state.validation ? getVerifiedHouseholdSet().length : 0;
   $('#map-count').textContent = `${state.dataset.length} households · ${mapped.length} mapped · ${eligible} eligible`;
-  if (mapped.length) window.reliefMap.fitBounds([hub, ...mapped], { padding: [42, 42], maxZoom: MAP_ZOOM });
-  else window.reliefMap.setView(hub, MAP_ZOOM, { animate: false });
-  window.reliefMap.invalidateSize();
+  safeFitMapBounds(window.reliefMap, [hub, ...mapped]);
 }
 
 const renderDatasetWithMap = renderDataset;
@@ -422,20 +558,24 @@ const HOUSEHOLD_LABELS = {
   householdsize: 'Members',
   compatible_resource: 'Compatible Resource',
   compatibleresource: 'Compatible Resource',
-  verificationstatus: 'Verification',
+  sourceverificationstatus: 'Source Verification',
+  verificationstatus: 'H* Status',
+  verificationreason: 'Verification Reason',
+  eligibilitystatus: 'Eligibility',
+  locationstatus: 'Research Area',
   pwd: 'PWD'
 };
 const VULNERABILITY_PATTERN = /senior|elderly|pwd|disab|pregnan|infant|child|children|solo.?parent|lactating|medical|vulnerab|special.?need|chronic/i;
 const EXTRA_INFO_PATTERN = /contact|phone|mobile|evacuation|shelter|damage|risk|hazard|flood|note|remark|income|livelihood|barangay|zone|purok|sitio/i;
 const NEGATIVE_FIELD_VALUES = /^(no|none|n\/a|na|false|0|not applicable)$/i;
 const AFFIRMATIVE_FIELD_VALUES = /^(yes|true|1)$/i;
-const NORMALIZED_TABLE_KEYS = ['household_id', 'address', 'urgency', 'compatible_resource', 'verification', 'geocoding_status', 'latitude', 'longitude', 'validation_status'];
+const NORMALIZED_TABLE_KEYS = ['household_id', 'address', 'urgency', 'compatible_resource', 'source_verification_status', 'verification_status', 'verification_reason', 'geocoding_status', 'location_status', 'eligibility_status', 'latitude', 'longitude', 'validation_status'];
 const MAPPING_FIELDS = [
   { key: 'householdId', label: 'Household ID', aliases: HOUSEHOLD_FIELD_ALIASES.id, required: true },
   { key: 'address', label: 'Address', aliases: HOUSEHOLD_FIELD_ALIASES.directAddress, required: false },
   { key: 'urgency', label: 'Urgency', aliases: HOUSEHOLD_FIELD_ALIASES.urgency, required: true },
   { key: 'compatibleResource', label: 'Required Resource', aliases: HOUSEHOLD_FIELD_ALIASES.compatibleResource, required: true },
-  { key: 'verification', label: 'Verification', aliases: HOUSEHOLD_FIELD_ALIASES.verification, required: true },
+  { key: 'verification', label: 'Source Verification', aliases: HOUSEHOLD_FIELD_ALIASES.verification, required: false },
   { key: 'latitude', label: 'Latitude', aliases: HOUSEHOLD_FIELD_ALIASES.latitude, required: false },
   { key: 'longitude', label: 'Longitude', aliases: HOUSEHOLD_FIELD_ALIASES.longitude, required: false }
 ];
@@ -461,7 +601,7 @@ function getMappingIssues(mapping = state.columnMapping, headers = state.rawHead
   const issues = [];
   MAPPING_FIELDS.forEach(field => {
     const candidates = getHeaderCandidates(headers, field.aliases);
-    if (candidates.length > 1 && !mapping[field.key]) issues.push({ field: field.key, level: 'error', message: `${field.label} has multiple possible columns. Select the correct one.` });
+    if (candidates.length > 1 && !mapping[field.key] && field.key !== 'verification') issues.push({ field: field.key, level: 'error', message: `${field.label} has multiple possible columns. Select the correct one.` });
     if (field.required && !mapping[field.key]) issues.push({ field: field.key, level: 'error', message: `${field.label} column is required.` });
   });
   const hasMappedCoordinates = mapping.latitude && mapping.longitude;
@@ -598,10 +738,13 @@ function normalizeHouseholdRow(raw, index) {
   const address = getAddressFromMappedColumns(raw);
   const urgency = parseUrgencyValue(getMappedValue(raw, 'urgency'));
   const verificationRaw = getMappedValue(raw, 'verification');
-  const verification = normalizeVerificationValue(verificationRaw);
+  const sourceVerification = hasDisplayValue(verificationRaw) ? normalizeVerificationValue(verificationRaw) : '';
   const compatibleResource = normalizeResourceRequirement(getMappedValue(raw, 'compatibleResource'));
-  const latitude = parseCoordinate(getMappedValue(raw, 'latitude'));
-  const longitude = parseCoordinate(getMappedValue(raw, 'longitude'));
+  const latitudeRaw = getMappedValue(raw, 'latitude');
+  const longitudeRaw = getMappedValue(raw, 'longitude');
+  const latitude = parseCoordinate(latitudeRaw);
+  const longitude = parseCoordinate(longitudeRaw);
+  const geocodingQuery = normalizeAddressQuery(address);
   const row = {
     ...raw,
     household_id: householdId,
@@ -609,22 +752,43 @@ function normalizeHouseholdRow(raw, index) {
     address,
     urgency: urgency ?? '',
     compatible_resource: compatibleResource,
-    verification,
-    verification_status: verification,
+    source_verification: verificationRaw,
+    source_verification_status: sourceVerification,
+    verification_status: 'Pending System Validation',
+    verification_reason: '',
+    source_latitude: latitudeRaw,
+    source_longitude: longitudeRaw,
     latitude: Number.isFinite(latitude) ? latitude : '',
     longitude: Number.isFinite(longitude) ? longitude : '',
+    resolved_latitude: Number.isFinite(latitude) ? latitude : '',
+    resolved_longitude: Number.isFinite(longitude) ? longitude : '',
+    geocoding_query: geocodingQuery,
     geocoding_status: Number.isFinite(latitude) && Number.isFinite(longitude) ? 'Provided Coordinates' : 'Pending',
     geocoding_provider: Number.isFinite(latitude) && Number.isFinite(longitude) ? 'Uploaded dataset' : '',
+    geocoding_display_name: '',
+    location_status: 'Pending Location Check',
+    research_area_distance_km: '',
     validation_status: 'Pending Validation',
+    eligibility_status: 'Pending Eligibility',
     _original: { ...raw },
     _sourceRow: index + 2,
-    _validationReasons: []
+    _validationReasons: [],
+    _locationReasons: [],
+    _eligibilityReasons: []
   };
   return row;
 }
 
 function addValidationReason(row, reason) {
   if (!row._validationReasons.includes(reason)) row._validationReasons.push(reason);
+}
+
+function addLocationReason(row, reason) {
+  if (reason && !row._locationReasons.includes(reason)) row._locationReasons.push(reason);
+}
+
+function addEligibilityReason(row, reason) {
+  if (reason && !row._eligibilityReasons.includes(reason)) row._eligibilityReasons.push(reason);
 }
 
 function validateHouseholdFields(row, duplicateIds) {
@@ -634,19 +798,49 @@ function validateHouseholdFields(row, duplicateIds) {
   if (parseUrgencyValue(row.urgency) === null) addValidationReason(row, 'Invalid urgency value');
   if (!hasDisplayValue(row.compatible_resource)) addValidationReason(row, 'Missing required resource');
   else if (!isKnownResourceRequirement(row.compatible_resource)) addValidationReason(row, 'Unknown required resource');
-  if (!hasDisplayValue(row.verification_status)) addValidationReason(row, 'Missing verification status');
-  else if (!['verified', 'pending', 'flagged', 'rejected'].includes(String(row.verification_status).toLowerCase())) addValidationReason(row, 'Unknown verification status');
+  if (hasDisplayValue(row.source_verification) && !['verified', 'pending', 'flagged', 'rejected'].includes(String(row.source_verification_status).toLowerCase())) addValidationReason(row, 'Unknown source verification status');
+}
+
+function titleCaseStatus(value) {
+  const text = String(value || '').trim().toLowerCase();
+  if (!text) return '';
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+function deriveSystemVerification(row, location) {
+  const sourceStatus = String(row.source_verification_status || '').trim().toLowerCase();
+  if (['pending', 'flagged', 'rejected'].includes(sourceStatus)) {
+    const status = titleCaseStatus(sourceStatus);
+    return { status, reason: `Source verification evidence is ${status}` };
+  }
+  if (row._validationReasons.length) {
+    return { status: 'Flagged', reason: `System validation failed: ${row._validationReasons.join('; ')}` };
+  }
+  if (!hasValidCoordinates(row) || location?.status === 'Unresolved Location') {
+    return { status: 'Pending', reason: 'System validation needs a resolved household location' };
+  }
+  if (isResearchBoundaryEnforced() && !location?.inside) {
+    return { status: 'Pending', reason: location?.reason || 'Location requires research-area review' };
+  }
+  if (sourceStatus === 'verified') {
+    return { status: 'Verified', reason: 'Source verification confirmed; system validation passed' };
+  }
+  return { status: 'Verified', reason: 'Derived by system validation: required fields and resolved coordinates are complete' };
 }
 
 async function resolveHouseholdLocation(row) {
+  row.geocoding_query = normalizeAddressQuery(row.address);
   if (hasValidCoordinates(row)) return;
   if (!hasDisplayValue(row.address)) return;
   const result = await geocodeAddress(row.address);
   if (Number.isFinite(result.latitude) && Number.isFinite(result.longitude)) {
     row.latitude = result.latitude;
     row.longitude = result.longitude;
+    row.resolved_latitude = result.latitude;
+    row.resolved_longitude = result.longitude;
     row.geocoding_status = result.status || 'Resolved';
     row.geocoding_provider = result.provider || RESEARCH_CONFIG.geocoding.provider;
+    row.geocoding_display_name = result.displayName || '';
   } else {
     row.geocoding_status = result.reason || 'Unresolved';
     addValidationReason(row, result.reason || 'Address could not be geocoded');
@@ -654,14 +848,33 @@ async function resolveHouseholdLocation(row) {
 }
 
 function finalizeGeographyValidation(row) {
+  let location;
   if (!hasValidCoordinates(row)) {
     if (!row._validationReasons.some(reason => reason.includes('geocoded'))) addValidationReason(row, 'Address could not be geocoded');
-    row.validation_status = 'Invalid';
-    return;
+    location = { status: 'Unresolved Location', inside: false, distanceKm: null, reason: 'Address could not be resolved' };
+  } else {
+    row.distance_km = geoDistanceKm(RELIEF_HUB.coordinates, [Number(row.latitude), Number(row.longitude)]).toFixed(4);
+    location = classifyResearchAreaLocation(row);
   }
-  row.distance_km = geoDistanceKm(RELIEF_HUB.coordinates, [Number(row.latitude), Number(row.longitude)]).toFixed(4);
-  if (!isInsideResearchAreaRow(row)) addValidationReason(row, 'Outside configured research area');
-  row.validation_status = row._validationReasons.length ? 'Invalid' : isPending(row) ? 'Pending Verification' : 'Valid';
+  row.location_status = location.status;
+  row.research_area_distance_km = Number.isFinite(location.distanceKm) ? location.distanceKm.toFixed(4) : '';
+  if (!location.inside) addLocationReason(row, location.reason || location.status);
+  if (isResearchBoundaryEnforced() && !location.inside) addEligibilityReason(row, location.reason || location.status);
+  const verification = deriveSystemVerification(row, location);
+  row.verification_status = verification.status;
+  row.verification_reason = verification.reason;
+  if (!isVerified(row)) addEligibilityReason(row, verification.reason);
+  if (row._validationReasons.length) {
+    row.validation_status = 'Invalid';
+    row._validationReasons.forEach(reason => addEligibilityReason(row, reason));
+  } else if (!isVerified(row)) {
+    row.validation_status = `${row.verification_status} Verification`;
+  } else if (!location.inside) {
+    row.validation_status = isResearchBoundaryEnforced() ? location.status : 'Location Review';
+  } else {
+    row.validation_status = 'Valid';
+  }
+  row.eligibility_status = isEligibleForAllocation(row) ? 'Eligible for Allocation' : 'Not Eligible';
 }
 
 function getDuplicateIds(rows) {
@@ -675,15 +888,24 @@ function getDuplicateIds(rows) {
 function computeValidationSummary(rows) {
   const validRows = rows.filter(row => !row._validationReasons.length);
   const resolvedRows = rows.filter(hasValidCoordinates);
+  const verifiedRows = rows.filter(isVerified);
+  const pendingRows = rows.filter(isPending);
+  const insideRows = resolvedRows.filter(isInsideResearchAreaRow);
+  const outsideRows = rows.filter(row => row.location_status === 'Outside Research Area');
+  const reviewRows = rows.filter(row => row.location_status === 'Needs Location Review' || row.validation_status === 'Location Review');
   return {
     totalRows: rows.length,
     validHouseholds: validRows.length,
-    eligibleHouseholds: rows.filter(row => !row._validationReasons.length && isVerified(row)).length,
-    pendingVerification: rows.filter(row => !row._validationReasons.length && isPending(row)).length,
+    verifiedHouseholds: verifiedRows.length,
+    eligibleHouseholds: rows.filter(isEligibleForAllocation).length,
+    pendingVerification: pendingRows.length,
     invalidRows: rows.filter(row => row._validationReasons.length).length,
     addressesResolved: resolvedRows.length,
     addressesUnresolved: rows.length - resolvedRows.length,
-    insideResearchArea: resolvedRows.filter(isInsideResearchAreaRow).length
+    insideResearchArea: insideRows.length,
+    outsideResearchArea: outsideRows.length,
+    needsLocationReview: reviewRows.length,
+    boundaryEnforced: isResearchBoundaryEnforced()
   };
 }
 
@@ -716,32 +938,37 @@ async function validateAndPrepareDataset({ autoRun = false } = {}) {
   }
   state.dataset = normalizedRows;
   state.invalidRows = normalizedRows.filter(row => row._validationReasons.length);
-  state.researchDataset = normalizedRows.filter(row => !row._validationReasons.length && isVerified(row) && hasValidCoordinates(row) && isInsideResearchAreaRow(row));
+  state.verifiedHouseholdSet = normalizedRows.filter(isEligibleForAllocation);
+  state.researchDataset = state.verifiedHouseholdSet;
   state.validation = computeValidationSummary(normalizedRows);
   state.results = {};
   state.latest = null;
   state.processing = false;
+  logGeographicValidationDiagnostics(normalizedRows);
   renderDataset();
   logAllocationDiagnostics(`Dataset validation: ${state.filename}`);
-  if (autoRun && state.researchDataset.length && !getRunBlockers('enhanced').length) {
+  if (autoRun && getVerifiedHouseholdSet().length && !getRunBlockers('enhanced').length) {
     compare();
     go('compare');
     toast(`${state.validation.eligibleHouseholds} verified households validated and compared`);
   } else {
     go('dataset');
-    toast(`${state.validation.validHouseholds} of ${state.validation.totalRows} households validated`);
+    toast(`${state.validation.verifiedHouseholds} verified, ${state.validation.pendingVerification} pending, ${state.validation.eligibleHouseholds} eligible`);
   }
 }
 
 function getRunBlockers(mode) {
   const blockers = [];
+  const hstar = getVerifiedHouseholdSet();
+  // This guards the application workflow; the Standard Hungarian solver itself
+  // still assumes its input is already valid and optimizes distance only.
   if (state.processing) blockers.push('Dataset is still being processed');
   if (!state.validation) blockers.push('Validate the dataset before running algorithms');
-  if (!state.researchDataset.length) blockers.push('No verified households with resolved locations are eligible');
-  if (state.researchDataset.length && !getActiveResources(state.researchDataset).length) blockers.push('No relief resources are configured');
+  if (!hstar.length) blockers.push('No households are available in verified set H*');
+  if (hstar.length && !getActiveResources(hstar).length) blockers.push('No relief resources are configured');
   if (mode === 'enhanced') {
-    const missingUrgency = state.researchDataset.filter(row => parseUrgencyValue(row.urgency) === null);
-    const missingResource = state.researchDataset.filter(row => !isKnownResourceRequirement(row.compatible_resource));
+    const missingUrgency = hstar.filter(row => parseUrgencyValue(row.urgency) === null);
+    const missingResource = hstar.filter(row => !isKnownResourceRequirement(row.compatible_resource));
     if (missingUrgency.length) blockers.push('Enhanced Algorithm cannot run because urgency data is missing or invalid');
     if (missingResource.length) blockers.push('Enhanced Algorithm cannot run because Resource Compatibility data is missing or invalid');
   }
@@ -783,6 +1010,22 @@ function renderColumnMappingPanel() {
   panel.querySelector('#validate-mapping').addEventListener('click', () => validateAndPrepareDataset());
 }
 
+function renderStagedValidationSummary(panel, summary) {
+  const attentionRows = summary
+    ? state.dataset.filter(row => row._validationReasons?.length || row._locationReasons?.length || row._eligibilityReasons?.length).slice(0, 12)
+    : [];
+  const issues = attentionRows.map(row => {
+    const reasons = [...(row._validationReasons || []), ...(row._locationReasons || []), ...(row._eligibilityReasons || [])].filter(Boolean);
+    return `<div class="validation-issue-row"><strong>${escapeHtml(row.household_id || `Row ${row._sourceRow}`)}</strong><span>${escapeHtml(reasons.join('; '))}</span></div>`;
+  }).join('');
+  const progress = state.processing
+    ? 'Processing dataset...'
+    : summary
+      ? `${summary.eligibleHouseholds} households are in verified set H* for both Standard and Enhanced algorithms. Boundary enforcement is ${summary.boundaryEnforced ? 'on' : 'off'} for this configured review boundary.`
+      : 'Map columns, then validate the uploaded dataset.';
+  panel.innerHTML = `<div class="panel-head"><div><p class="eyebrow">System verification</p><h3>Research readiness</h3></div><span class="live-label">${state.processing ? 'Processing' : summary ? 'Validated' : 'Awaiting validation'}</span></div><div class="validation-summary-grid"><div><span>Total records</span><strong>${summary?.totalRows ?? state.rawRows.length}</strong></div><div><span>Verified H*</span><strong>${summary?.verifiedHouseholds ?? '---'}</strong></div><div><span>Pending</span><strong>${summary?.pendingVerification ?? '---'}</strong></div><div><span>Addresses resolved</span><strong>${summary?.addressesResolved ?? '---'}</strong></div><div><span>Addresses unresolved</span><strong>${summary?.addressesUnresolved ?? '---'}</strong></div><div><span>Inside research area</span><strong>${summary?.insideResearchArea ?? '---'}</strong></div><div><span>Needs location review</span><strong>${summary?.needsLocationReview ?? '---'}</strong></div><div><span>Outside research area</span><strong>${summary?.outsideResearchArea ?? '---'}</strong></div><div><span>Same H* to both</span><strong>${summary?.eligibleHouseholds ?? '---'}</strong></div></div><p class="validation-progress" id="validation-progress">${escapeHtml(progress)}</p>${issues ? `<div class="validation-issues">${issues}</div>` : ''}`;
+}
+
 function renderValidationSummary() {
   const panel = ensureDatasetPanel('validation-panel', 'validation-panel');
   if (!panel) return;
@@ -792,8 +1035,8 @@ function renderValidationSummary() {
   }
   panel.classList.remove('hidden');
   const summary = state.validation;
-  const issues = state.invalidRows.slice(0, 12).map(row => `<div class="validation-issue-row"><strong>${escapeHtml(row.household_id || `Row ${row._sourceRow}`)}</strong><span>${escapeHtml(row._validationReasons.join('; '))}</span></div>`).join('');
-  panel.innerHTML = `<div class="panel-head"><div><p class="eyebrow">Dataset validation</p><h3>Research readiness</h3></div><span class="live-label">${state.processing ? 'Processing' : summary ? 'Validated' : 'Awaiting validation'}</span></div><div class="validation-summary-grid"><div><span>Total rows</span><strong>${summary?.totalRows ?? state.rawRows.length}</strong></div><div><span>Valid households</span><strong>${summary?.validHouseholds ?? '—'}</strong></div><div><span>Pending verification</span><strong>${summary?.pendingVerification ?? '—'}</strong></div><div><span>Invalid rows</span><strong>${summary?.invalidRows ?? '—'}</strong></div><div><span>Addresses resolved</span><strong>${summary?.addressesResolved ?? '—'}</strong></div><div><span>Addresses unresolved</span><strong>${summary?.addressesUnresolved ?? '—'}</strong></div></div><p class="validation-progress" id="validation-progress">${state.processing ? 'Processing dataset...' : summary ? `${summary.eligibleHouseholds} verified households are eligible for both algorithms.` : 'Map columns, then validate the uploaded dataset.'}</p>${issues ? `<div class="validation-issues">${issues}</div>` : ''}`;
+  renderStagedValidationSummary(panel, summary);
+  return;
 }
 
 function getDatasetTableKeys(rows) {
@@ -815,7 +1058,7 @@ function formatCellValue(value) {
 
 function getCellClass(key, value) {
   const text = String(value || '').toLowerCase();
-  if (key === 'verification' || key === 'verification_status' || key === 'validation_status') return text.replace(/\s+/g, '-');
+  if (key === 'verification' || key === 'source_verification_status' || key === 'verification_status' || key === 'validation_status' || key === 'location_status' || key === 'eligibility_status') return text.replace(/\s+/g, '-');
   if (key === 'geocoding_status') return text.includes('unresolved') || text.includes('unavailable') ? 'invalid' : text.toLowerCase();
   return '';
 }
@@ -825,6 +1068,7 @@ function getHouseholdId(row) {
 }
 
 function getVerificationStatus(row) {
+  if (hasDisplayValue(row?.verification_status)) return String(row.verification_status).trim();
   return findDatasetField(row, HOUSEHOLD_FIELD_ALIASES.verification)?.value || '';
 }
 
@@ -840,12 +1084,50 @@ function isInsideResearchAreaRow(row) {
   return hasValidCoordinates(row) && isInsideResearchArea(Number(row.latitude), Number(row.longitude));
 }
 
+function isEligibleForAllocation(row) {
+  const passesBoundary = !isResearchBoundaryEnforced() || isInsideResearchAreaRow(row);
+  return !row._validationReasons?.length && isVerified(row) && hasValidCoordinates(row) && passesBoundary;
+}
+
 function householdIds(rows) {
   return rows.map(row => getHouseholdId(row.household || row) || '(missing id)');
 }
 
 function makeDiagnosticStage(stage, rows, note = '') {
   return { stage, count: rows.length, ids: householdIds(rows).join(', '), note };
+}
+
+function logGeographicValidationDiagnostics(rows) {
+  if (!DEBUG_ALGORITHM_DIAGNOSTICS || typeof console === 'undefined') return;
+  const limits = getResearchAreaLimits();
+  const boundary = {
+    name: RESEARCH_CONFIG.researchArea?.name || RESEARCH_CONFIG.areaName,
+    type: RESEARCH_CONFIG.researchArea?.type || 'unknown',
+    coordinateOrder: '[latitude, longitude] for Leaflet bbox checks',
+    enforceBoundaryForEligibility: isResearchBoundaryEnforced(),
+    reviewBufferKm: getLocationReviewBufferKm(),
+    minLat: limits?.minLat ?? '',
+    maxLat: limits?.maxLat ?? '',
+    minLng: limits?.minLon ?? '',
+    maxLng: limits?.maxLon ?? ''
+  };
+  console.groupCollapsed(`[Geographic validation] ${state.filename || 'Uploaded dataset'}`);
+  console.table([boundary]);
+  console.table(rows.map(row => ({
+    householdId: row.household_id || `Row ${row._sourceRow}`,
+    originalAddress: row._original?.[state.columnMapping.address] || row.address || '',
+    normalizedQuery: row.geocoding_query || '',
+    resolvedLatitude: row.latitude || '',
+    resolvedLongitude: row.longitude || '',
+    geocodingQuality: row.geocoding_status || '',
+    geocodingDisplayName: row.geocoding_display_name || '',
+    researchAreaCheck: row.location_status || '',
+    insideConfiguredBoundary: isInsideResearchAreaRow(row),
+    verificationStatus: row.verification_status || '',
+    eligibilityStatus: row.eligibility_status || '',
+    reason: [...(row._validationReasons || []), ...(row._locationReasons || []), ...(row._eligibilityReasons || [])].join('; ')
+  })));
+  console.groupEnd();
 }
 
 function logAllocationDiagnostics(label, result = null, mapItems = null) {
@@ -856,25 +1138,31 @@ function logAllocationDiagnostics(label, result = null, mapItems = null) {
   const verifiedRows = rows.filter(isVerified);
   const pendingRows = rows.filter(isPending);
   const insideRows = resolvedLocationRows.filter(isInsideResearchAreaRow);
+  const reviewRows = rows.filter(row => row.location_status === 'Needs Location Review' || row.validation_status === 'Location Review');
+  const outsideRows = rows.filter(row => row.location_status === 'Outside Research Area');
+  const eligibleRows = rows.filter(isEligibleForAllocation);
   const stages = [
     makeDiagnosticStage('CSV rows loaded', rows),
-    makeDiagnosticStage('Resolved location rows', resolvedLocationRows),
+    makeDiagnosticStage('Valid coordinate rows', resolvedLocationRows),
     makeDiagnosticStage('Unresolved address rows', unresolvedRows),
     makeDiagnosticStage('Verified households', verifiedRows),
     makeDiagnosticStage('Pending households', pendingRows),
     makeDiagnosticStage('Households inside research area', insideRows),
-    makeDiagnosticStage('Households sent to algorithm', state.researchDataset),
+    makeDiagnosticStage('Households needing location review', reviewRows),
+    makeDiagnosticStage('Households outside research area', outsideRows),
+    makeDiagnosticStage('Households sent to algorithm', eligibleRows),
     makeDiagnosticStage('Assignment results', result?.output?.map(item => item.household) || [], result ? `${result.mode} output rows from ${resources.length} configured relief resources` : 'not run yet'),
     makeDiagnosticStage('Households sent to map', mapItems?.map(item => item.household || item) || [], mapItems ? 'rendered marker rows' : 'not rendered yet')
   ];
   console.groupCollapsed(`[Allocation diagnostics] ${label}`);
   console.table(stages);
   stages.forEach(item => console.log(`${item.stage}: ${item.count}`, item.ids || '(none)', item.note || ''));
-  const outsideRows = resolvedLocationRows.filter(row => !isInsideResearchAreaRow(row));
-  if (outsideRows.length) {
-    console.warn('[Allocation diagnostics] Rows outside configured Barangay 160 bounds', {
-      bounds: RELIEF_HUB.bounds,
-      ids: householdIds(outsideRows).join(', ')
+  if (outsideRows.length || reviewRows.length) {
+    console.warn('[Allocation diagnostics] Rows outside or near the configured Barangay 160 review boundary', {
+      boundary: getResearchAreaLimits(),
+      boundaryEnforced: isResearchBoundaryEnforced(),
+      outsideIds: householdIds(outsideRows).join(', '),
+      reviewIds: householdIds(reviewRows).join(', ')
     });
   }
   console.groupEnd();
@@ -992,18 +1280,20 @@ function getHouseholdCardContext(item) {
   const headField = findDatasetField(row, HOUSEHOLD_FIELD_ALIASES.head);
   const membersField = findDatasetField(row, HOUSEHOLD_FIELD_ALIASES.members);
   const urgencyField = findDatasetField(row, HOUSEHOLD_FIELD_ALIASES.urgency);
-  const verificationField = findDatasetField(row, HOUSEHOLD_FIELD_ALIASES.verification);
+  const verificationField = hasDisplayValue(row.verification_status) ? { key: 'verification_status', value: row.verification_status } : findDatasetField(row, HOUSEHOLD_FIELD_ALIASES.verification);
+  const verificationReasonField = hasDisplayValue(row.verification_reason) ? { key: 'verification_reason', value: row.verification_reason } : null;
+  const sourceVerificationField = hasDisplayValue(row.source_verification_status) ? { key: 'source_verification_status', value: row.source_verification_status } : null;
   const compatibleField = findDatasetField(row, HOUSEHOLD_FIELD_ALIASES.compatibleResource);
   const statusField = findDatasetField(row, HOUSEHOLD_FIELD_ALIASES.assignmentStatus);
   const assignmentStatus = item.assignmentStatus || statusField?.value || (item.assigned === false ? 'Unassigned' : 'Assigned');
   const allocation = item.assigned === false ? 'Unassigned' : item.resource;
 
   rememberField(usedFields, idField);
-  return { row, usedFields, idField, headField, membersField, urgencyField, verificationField, compatibleField, statusField, assignmentStatus, allocation };
+  return { row, usedFields, idField, headField, membersField, urgencyField, verificationField, verificationReasonField, sourceVerificationField, compatibleField, statusField, assignmentStatus, allocation };
 }
 
 function buildExistingHouseholdInfoHtml(item, hubDistance) {
-  const { row, usedFields, idField, headField, membersField, urgencyField, verificationField, compatibleField, assignmentStatus, allocation } = getHouseholdCardContext(item);
+  const { row, usedFields, idField, headField, membersField, urgencyField, verificationField, verificationReasonField, sourceVerificationField, compatibleField, assignmentStatus, allocation } = getHouseholdCardContext(item);
   const householdId = idField?.value || 'Household';
   const urgencyMeta = urgencyField ? getUrgencyMeta(urgencyField.value) : null;
   const algorithmDetails = [];
@@ -1017,9 +1307,11 @@ function buildExistingHouseholdInfoHtml(item, hubDistance) {
   addHouseholdDetail(algorithmDetails, usedFields, 'Assignment basis', basis);
   addHouseholdDetail(algorithmDetails, usedFields, 'Distance from hub', `${hubDistance} km`);
   if (typeof item.value === 'number' && Number.isFinite(item.value)) addHouseholdDetail(algorithmDetails, usedFields, 'Distance cost', `${item.value.toFixed(3)} km`);
-  addHouseholdDetail(algorithmDetails, usedFields, 'Verification', verificationField);
+  addHouseholdDetail(algorithmDetails, usedFields, 'H* status', verificationField);
   addHouseholdDetail(algorithmDetails, usedFields, 'Assignment status', assignmentStatus);
 
+  addHouseholdDetail(datasetDetails, usedFields, 'Verification reason', verificationReasonField);
+  addHouseholdDetail(datasetDetails, usedFields, 'Source verification', sourceVerificationField);
   addHouseholdDetail(datasetDetails, usedFields, 'Representative', headField);
   addHouseholdDetail(datasetDetails, usedFields, 'Address', getAddressField(row, usedFields));
   addHouseholdDetail(datasetDetails, usedFields, 'Members', membersField);
@@ -1029,7 +1321,8 @@ function buildExistingHouseholdInfoHtml(item, hubDistance) {
   }
   addHouseholdDetail(datasetDetails, usedFields, 'Required resource', compatibleField);
   addHouseholdDetail(datasetDetails, usedFields, 'Compatibility', compatibilityEvaluation);
-  addHouseholdDetail(datasetDetails, usedFields, 'Location status', row.geocoding_status);
+  addHouseholdDetail(datasetDetails, usedFields, 'Geocoding status', row.geocoding_status);
+  addHouseholdDetail(datasetDetails, usedFields, 'Research area', row.location_status);
   if (Number.isFinite(lat) && Number.isFinite(lon)) addHouseholdDetail(datasetDetails, usedFields, 'Coordinates', `${lat.toFixed(5)}, ${lon.toFixed(5)}`);
 
   const vulnerabilities = getVulnerabilityItems(row, usedFields);
@@ -1043,7 +1336,7 @@ function buildExistingHouseholdInfoHtml(item, hubDistance) {
 }
 
 function buildEnhancedHouseholdInfoHtml(item, hubDistance) {
-  const { row, usedFields, idField, headField, membersField, urgencyField, verificationField, compatibleField, assignmentStatus, allocation } = getHouseholdCardContext(item);
+  const { row, usedFields, idField, headField, membersField, urgencyField, verificationField, verificationReasonField, sourceVerificationField, compatibleField, assignmentStatus, allocation } = getHouseholdCardContext(item);
   const householdId = idField?.value || 'Household';
   const urgencyMeta = urgencyField ? getUrgencyMeta(urgencyField.value) : null;
   const algorithmDetails = [];
@@ -1067,12 +1360,15 @@ function buildEnhancedHouseholdInfoHtml(item, hubDistance) {
     addHouseholdDetail(algorithmDetails, usedFields, 'Compatibility component', item.components.compatibilityComponent.toFixed(3));
   }
   addHouseholdDetail(algorithmDetails, usedFields, 'Distance from hub', `${hubDistance} km`);
-  addHouseholdDetail(algorithmDetails, usedFields, 'Verification', verificationField);
+  addHouseholdDetail(algorithmDetails, usedFields, 'H* status', verificationField);
 
+  addHouseholdDetail(datasetDetails, usedFields, 'Verification reason', verificationReasonField);
+  addHouseholdDetail(datasetDetails, usedFields, 'Source verification', sourceVerificationField);
   addHouseholdDetail(datasetDetails, usedFields, 'Representative', headField);
   addHouseholdDetail(datasetDetails, usedFields, 'Address', getAddressField(row, usedFields));
   addHouseholdDetail(datasetDetails, usedFields, 'Members', membersField);
-  addHouseholdDetail(datasetDetails, usedFields, 'Location status', row.geocoding_status);
+  addHouseholdDetail(datasetDetails, usedFields, 'Geocoding status', row.geocoding_status);
+  addHouseholdDetail(datasetDetails, usedFields, 'Research area', row.location_status);
   if (Number.isFinite(lat) && Number.isFinite(lon)) addHouseholdDetail(datasetDetails, usedFields, 'Coordinates', `${lat.toFixed(5)}, ${lon.toFixed(5)}`);
 
   const vulnerabilities = getVulnerabilityItems(row, usedFields);
@@ -1089,11 +1385,21 @@ function buildHouseholdInfoHtml(item, target, hubDistance) {
     : buildEnhancedHouseholdInfoHtml(item, hubDistance);
 }
 
+function needsLocationReview(row) {
+  return row.location_status === 'Needs Location Review' || row.validation_status === 'Location Review';
+}
+
+function isOutsideResearchArea(row) {
+  return row.location_status === 'Outside Research Area';
+}
+
 function getComputedAssignmentStatus(row, assignment) {
   if (assignment) return assignment.assignmentStatus || 'Assigned';
   const verification = getVerificationStatus(row).trim();
   if (verification.toLowerCase() === 'pending') return 'Pending Verification';
   if (verification && verification.toLowerCase() !== 'verified') return `${verification} Verification`;
+  if (needsLocationReview(row)) return 'Needs Location Review';
+  if (isOutsideResearchArea(row)) return 'Outside Research Area';
   return 'Unassigned';
 }
 
@@ -1117,11 +1423,18 @@ function getAssignmentMapItems(result) {
   return buildAssignmentMapItems(result);
 }
 
+function getDatasetMarkerStyle(row, priorityColor, assignedColor = priorityColor) {
+  const base = { radius: 7, color: '#fff', weight: 2, fillColor: assignedColor, fillOpacity: .95, opacity: 1 };
+  if (isPending(row)) return { ...base, color: priorityColor, fillColor: '#fff', fillOpacity: .28, opacity: .72, dashArray: '3 3' };
+  if (needsLocationReview(row)) return { ...base, color: priorityColor, fillColor: '#fff', fillOpacity: .36, opacity: .82, dashArray: '4 3' };
+  if (isOutsideResearchArea(row)) return { ...base, color: '#748397', fillColor: '#fff', fillOpacity: .18, opacity: .65, dashArray: '1 4' };
+  return base;
+}
+
 function getHouseholdMarkerStyle(item, target, priorityColor) {
   const assignedColor = target === 'existing' ? '#29496b' : priorityColor;
-  const base = { radius: 7, color: '#fff', weight: 2, fillColor: assignedColor, fillOpacity: .95, opacity: 1 };
-  if (isPending(item.household)) return { ...base, color: target === 'existing' ? '#748397' : priorityColor, fillColor: '#fff', fillOpacity: .28, opacity: .72, dashArray: '3 3' };
-  if (!item.assigned) return { ...base, fillOpacity: .5, opacity: .9, dashArray: '2 3' };
+  const base = getDatasetMarkerStyle(item.household, target === 'existing' ? '#748397' : priorityColor, assignedColor);
+  if (!item.assigned) return { ...base, fillOpacity: Math.min(base.fillOpacity ?? .95, .5), opacity: Math.min(base.opacity ?? 1, .9), dashArray: base.dashArray || '2 3' };
   return base;
 }
 
@@ -1148,11 +1461,11 @@ function refreshAssignmentMapSize(target) {
   const map = window.assignmentMaps?.[target];
   if (!map) return;
   setTimeout(() => {
-    map.invalidateSize({ pan: false });
+    scheduleMapInvalidate(map);
     positionHouseholdInfoCard(map);
   }, 0);
   setTimeout(() => {
-    map.invalidateSize({ pan: false });
+    scheduleMapInvalidate(map);
     positionHouseholdInfoCard(map);
   }, 180);
 }
@@ -1319,6 +1632,8 @@ function renderAssignmentMap(result) {
   window.assignmentMapLayers[target] = [];
   const hub = RELIEF_HUB.coordinates;
   window.assignmentMapLayers[target].push(addHubMarker(map));
+  const boundaryLayer = addResearchBoundaryLayer(map);
+  if (boundaryLayer) window.assignmentMapLayers[target].push(boundaryLayer);
   const bounds = [hub];
   const mapItems = getAssignmentMapItems(result);
   const mappedItems = [];
@@ -1326,7 +1641,7 @@ function renderAssignmentMap(result) {
   mapItems.forEach(item => {
     const lat = Number(item.household.latitude);
     const lon = Number(item.household.longitude);
-    if (!Number.isFinite(lat) || !Number.isFinite(lon) || !isInsideResearchArea(lat, lon)) return;
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
     const point = [lat, lon];
     const { color } = getUrgencyMeta(item.household.urgency);
     const hubDistance = geoDistanceKm(hub, point).toFixed(2);
@@ -1345,18 +1660,29 @@ function renderAssignmentMap(result) {
   const mappedNote = mappedItems.length === state.dataset.length ? '' : ` · ${mappedItems.length} mapped`;
   $(`#${target}-assignment-map-count`).textContent = `${state.dataset.length} households · ${verifiedCount} verified · ${routeCount} assigned${mappedNote}`;
   logAllocationDiagnostics(`${target} assignment map render`, result, mappedItems);
-  if (mappedItems.length) map.fitBounds(bounds, { padding: [42, 42], maxZoom: MAP_ZOOM });
-  else map.setView(hub, MAP_ZOOM, { animate: false });
-  map.invalidateSize();
-  setTimeout(() => map.invalidateSize(), 0);
+  safeFitMapBounds(map, bounds);
 }
 
 function refreshVisibleAssignmentMaps() {
   if (!window.assignmentMaps) return;
   Object.values(window.assignmentMaps).forEach(map => {
-    map.invalidateSize({ pan: false });
+    scheduleMapInvalidate(map);
     positionHouseholdInfoCard(map);
   });
+}
+
+function refreshVisibleComparisonMaps() {
+  if (!window.comparisonMaps) return;
+  Object.values(window.comparisonMaps).forEach(map => {
+    scheduleMapInvalidate(map);
+    positionHouseholdInfoCard(map);
+  });
+}
+
+function refreshAllLeafletMaps() {
+  if (window.reliefMap) scheduleMapInvalidate(window.reliefMap);
+  refreshVisibleAssignmentMaps();
+  refreshVisibleComparisonMaps();
 }
 
 const renderResultWithMap = renderResult;
@@ -1365,10 +1691,11 @@ const goWithMapRefresh = go;
 go = function (page) {
   if (window.expandedAssignmentMap && window.expandedAssignmentMap !== page) setAssignmentMapExpanded(window.expandedAssignmentMap, false);
   goWithMapRefresh(page);
-  setTimeout(refreshVisibleAssignmentMaps, 0);
+  setTimeout(refreshAllLeafletMaps, 0);
+  setTimeout(refreshAllLeafletMaps, 180);
 };
 window.addEventListener('resize', () => {
-  refreshVisibleAssignmentMaps();
+  refreshAllLeafletMaps();
   if (window.expandedAssignmentMap) refreshAssignmentMapSize(window.expandedAssignmentMap);
 });
 document.addEventListener('keydown', event => {
@@ -1400,11 +1727,13 @@ function renderComparisonMap(result, target) {
   const hub = RELIEF_HUB.coordinates;
   const bounds = [hub];
   window.comparisonMapLayers[target].push(addHubMarker(map, 'Relief hub'));
+  const boundaryLayer = addResearchBoundaryLayer(map);
+  if (boundaryLayer) window.comparisonMapLayers[target].push(boundaryLayer);
   hideHouseholdInfoCard(map, true);
   getAssignmentMapItems(result).forEach(item => {
     const lat = Number(item.household.latitude);
     const lon = Number(item.household.longitude);
-    if (!Number.isFinite(lat) || !Number.isFinite(lon) || !isInsideResearchArea(lat, lon)) return;
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
     const point = [lat, lon];
     const { color } = getUrgencyMeta(item.household.urgency);
     const hubDistance = geoDistanceKm(hub, point).toFixed(2);
@@ -1417,11 +1746,9 @@ function renderComparisonMap(result, target) {
     window.comparisonMapLayers[target].push(marker);
     bounds.push(point);
   });
-  if (bounds.length > 1) map.fitBounds(bounds, { padding: [36, 36], maxZoom: MAP_ZOOM });
-  else map.setView(hub, MAP_ZOOM, { animate: false });
-  map.invalidateSize();
+  safeFitMapBounds(map, bounds, { padding: [36, 36] });
 }
 
 const compareWithMap = compare;
-compare = function () { compareWithMap(); renderComparisonMaps(); setTimeout(() => { if (window.comparisonMaps) Object.values(window.comparisonMaps).forEach(map => map.invalidateSize({ pan: false })); }, 0); };
+compare = function () { compareWithMap(); renderComparisonMaps(); setTimeout(refreshAllLeafletMaps, 0); };
 initializeApp();
