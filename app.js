@@ -1,6 +1,9 @@
 const resources = ['Relief-01', 'Relief-02', 'Relief-03', 'Relief-04', 'Relief-05', 'Relief-06', 'Relief-07', 'Relief-08'];
 const resourceTypes = ['Water', 'Food', 'Medical', 'Shelter'];
-function deriveAHPWeights() { const matrix = [[1, 1 / 3, 1 / 2], [3, 1, 2], [2, 1 / 2, 1]]; const geometricMeans = matrix.map(row => Math.pow(row.reduce((product, value) => product * value, 1), 1 / row.length)); const total = geometricMeans.reduce((sum, value) => sum + value, 0); return { distance: geometricMeans[0] / total, urgency: geometricMeans[1] / total, compatibility: geometricMeans[2] / total }; }
+const RESEARCH_WEIGHTS = Object.freeze({ distance: 0.164, urgency: 0.539, compatibility: 0.297 });
+const BENCHMARK_MATRIX_SIZES = Object.freeze([10, 20, 30, 40, 50, 60]);
+const HIGH_URGENCY_THRESHOLD = 7;
+function deriveAHPWeights() { return { ...RESEARCH_WEIGHTS }; }
 const DEBUG_ALGORITHM_DIAGNOSTICS = false;
 // Bump this key whenever geocoding rules change so stale, unconstrained matches
 // cannot silently re-enter the Barangay 160 dataset.
@@ -196,6 +199,8 @@ function classifyResearchAreaLocation(row) {
 }
 function isVerified(row) { return String(row.verification_status || row.verification || '').trim().toLowerCase() === 'verified'; }
 function resourceType(index) { return resourceTypes[index % resourceTypes.length]; }
+function resourceLabel(index) { return resources[index] || `Relief-${String(index + 1).padStart(2, '0')}`; }
+function formatAssignedResource(index) { return `${resourceLabel(index)} (${resourceType(index)})`; }
 function isCompatible(row, resourceIndex) { return String(row.compatible_resource || '').trim().toLowerCase() === resourceType(resourceIndex).toLowerCase(); }
 const $ = selector => document.querySelector(selector);
 function toast(message) { const el = $('#toast'); el.textContent = message; el.classList.add('show'); setTimeout(() => el.classList.remove('show'), 2200); }
@@ -311,8 +316,12 @@ function distance(row) {
 }
 function hungarian(matrix) { const n = matrix.length, m = matrix[0].length, u = Array(n + 1).fill(0), v = Array(m + 1).fill(0), p = Array(m + 1).fill(0), way = Array(m + 1).fill(0); for (let i = 1; i <= n; i++) { p[0] = i; let j0 = 0; const minv = Array(m + 1).fill(Infinity), used = Array(m + 1).fill(false); do { used[j0] = true; const i0 = p[j0]; let delta = Infinity, j1 = 0; for (let j = 1; j <= m; j++) if (!used[j]) { const cur = matrix[i0 - 1][j - 1] - u[i0] - v[j]; if (cur < minv[j]) { minv[j] = cur; way[j] = j0; } if (minv[j] < delta) { delta = minv[j]; j1 = j; } } for (let j = 0; j <= m; j++) { if (used[j]) { u[p[j]] += delta; v[j] -= delta; } else minv[j] -= delta; } j0 = j1; } while (p[j0] !== 0); do { const j1 = way[j0]; p[j0] = p[j1]; j0 = j1; } while (j0 !== 0); } const result = Array(n); for (let j = 1; j <= m; j++) result[p[j] - 1] = j - 1; return result; }
 function normalize(values) { const min = Math.min(...values), max = Math.max(...values); return max === min ? values.map(() => 0) : values.map(value => (value - min) / (max - min)); }
-function getActiveResources(rows) {
-  return resources.slice(0, Math.min(resources.length, rows.length));
+function getActiveResources(rows, requestedCount = null) {
+  const hasRequestedCount = requestedCount !== null && requestedCount !== undefined && requestedCount !== '';
+  const parsedCount = Number(requestedCount);
+  const defaultCount = Math.min(resources.length, rows.length);
+  const count = hasRequestedCount && Number.isFinite(parsedCount) ? Math.min(parsedCount, rows.length) : defaultCount;
+  return Array.from({ length: Math.max(0, count) }, (_, index) => resourceLabel(index));
 }
 
 function getVerifiedHouseholdSet() {
@@ -350,14 +359,193 @@ function buildEnhancedCostMatrix(rows, activeResources) {
   };
 }
 
-function makeMatrix(mode) {
+function makeMatrix(mode, rows = getVerifiedHouseholdSet(), activeResources = getActiveResources(rows)) {
   // Controlled experiment: H* is produced once by system validation, then both
   // algorithms receive the same household coordinates, hub, and resource order.
-  const rows = getVerifiedHouseholdSet();
-  const activeResources = getActiveResources(rows);
   return mode === 'existing'
     ? { ...buildExistingCostMatrix(rows, activeResources), activeResources }
     : { ...buildEnhancedCostMatrix(rows, activeResources), activeResources };
+}
+
+function isFiniteNumber(value) {
+  if (value === null || value === undefined || value === '') return false;
+  return Number.isFinite(Number(value));
+}
+
+function round(value, digits = 2) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric.toFixed(digits) : 'N/A';
+}
+
+function formatDistanceKm(value, digits = 2) {
+  return isFiniteNumber(value) ? `${round(value, digits)} km` : 'N/A';
+}
+
+function formatPercent(value, digits = 1) {
+  return isFiniteNumber(value) ? `${(Number(value) * 100).toFixed(digits)}%` : 'N/A';
+}
+
+function formatPercentagePoint(value, digits = 1) {
+  if (!isFiniteNumber(value)) return 'N/A';
+  const numeric = Number(value) * 100;
+  return `${numeric > 0 ? '+' : ''}${numeric.toFixed(digits)} pp`;
+}
+
+function formatAbsolutePercentagePoint(value, digits = 1) {
+  if (!isFiniteNumber(value)) return 'N/A';
+  return `${Math.abs(Number(value) * 100).toFixed(digits)} pp`;
+}
+
+function formatSignedNumber(value, digits = 2, suffix = '') {
+  if (!isFiniteNumber(value)) return 'N/A';
+  const numeric = Number(value);
+  return `${numeric > 0 ? '+' : ''}${numeric.toFixed(digits)}${suffix}`;
+}
+
+function formatSignedInteger(value) {
+  if (!isFiniteNumber(value)) return 'N/A';
+  const numeric = Number(value);
+  return `${numeric > 0 ? '+' : ''}${numeric}`;
+}
+
+function formatCoefficient(value) {
+  return isFiniteNumber(value) ? Number(value).toFixed(3) : 'Requires varied data';
+}
+
+function formatDurationMs(value) {
+  return isFiniteNumber(value) ? `${Number(value).toFixed(2)} ms` : 'N/A';
+}
+
+function getResultAssignmentMaps(result) {
+  const byRow = new Map();
+  const byId = new Map();
+  (result?.output || []).forEach(item => {
+    byRow.set(item.household, item);
+    const id = getHouseholdId(item.household);
+    if (id) byId.set(id, item);
+  });
+  return { byRow, byId };
+}
+
+function getResultAssignmentForRow(result, row, maps = getResultAssignmentMaps(result)) {
+  const id = getHouseholdId(row);
+  return maps.byRow.get(row) || (id ? maps.byId.get(id) : null);
+}
+
+function averageRanks(values) {
+  const ranked = values.map((value, index) => ({ value: Number(value), index })).sort((a, b) => a.value - b.value);
+  const ranks = Array(values.length).fill(0);
+  for (let index = 0; index < ranked.length;) {
+    let end = index + 1;
+    while (end < ranked.length && ranked[end].value === ranked[index].value) end += 1;
+    const rank = (index + 1 + end) / 2;
+    for (let cursor = index; cursor < end; cursor++) ranks[ranked[cursor].index] = rank;
+    index = end;
+  }
+  return ranks;
+}
+
+function pearsonCorrelation(left, right) {
+  if (left.length !== right.length || left.length < 2) return null;
+  const leftMean = left.reduce((sum, value) => sum + value, 0) / left.length;
+  const rightMean = right.reduce((sum, value) => sum + value, 0) / right.length;
+  let numerator = 0;
+  let leftVariance = 0;
+  let rightVariance = 0;
+  for (let index = 0; index < left.length; index++) {
+    const leftDelta = left[index] - leftMean;
+    const rightDelta = right[index] - rightMean;
+    numerator += leftDelta * rightDelta;
+    leftVariance += leftDelta ** 2;
+    rightVariance += rightDelta ** 2;
+  }
+  const denominator = Math.sqrt(leftVariance * rightVariance);
+  return denominator ? numerator / denominator : null;
+}
+
+function spearmanCorrelation(left, right) {
+  const pairs = left.map((value, index) => [Number(value), Number(right[index])]).filter(([a, b]) => Number.isFinite(a) && Number.isFinite(b));
+  if (pairs.length < 2) return null;
+  const leftRanks = averageRanks(pairs.map(([value]) => value));
+  const rightRanks = averageRanks(pairs.map(([, value]) => value));
+  return pearsonCorrelation(leftRanks, rightRanks);
+}
+
+function isAssignedCompatible(item) {
+  return Boolean(item && typeof item.resourceIndex === 'number' && item.household && isCompatible(item.household, item.resourceIndex));
+}
+
+function calculateAssignmentMetrics(output, rows) {
+  const assignmentCount = output.length;
+  const compatibleAssignments = output.filter(isAssignedCompatible).length;
+  const mismatchCount = assignmentCount - compatibleAssignments;
+  const totalDistance = output.reduce((sum, item) => sum + (Number(item.distanceKm) || 0), 0);
+  const meanDistance = assignmentCount ? totalDistance / assignmentCount : null;
+  const maxDistance = assignmentCount ? Math.max(...output.map(item => Number(item.distanceKm) || 0)) : null;
+  const assignmentMaps = getResultAssignmentMaps({ output });
+  const highUrgencyRows = rows.filter(row => Number(row.urgency) >= HIGH_URGENCY_THRESHOLD);
+  const highUrgencyCorrect = highUrgencyRows.filter(row => isAssignedCompatible(getResultAssignmentForRow({ output }, row, assignmentMaps))).length;
+  const urgencyValues = output.map(item => Number(item.household?.urgency));
+  const compatibilityValues = output.map(item => isAssignedCompatible(item) ? 1 : 0);
+  const prioritizationEfficiency = spearmanCorrelation(urgencyValues, compatibilityValues);
+  return {
+    assignmentCount,
+    compatibleAssignments,
+    mismatchCount,
+    highUrgencyCorrect,
+    highUrgencyTotal: highUrgencyRows.length,
+    allocationAccuracy: assignmentCount ? compatibleAssignments / assignmentCount : null,
+    compatibilityRate: assignmentCount ? compatibleAssignments / assignmentCount : null,
+    totalDistance,
+    meanDistance,
+    maxDistance,
+    prioritizationEfficiency,
+    nativeCost: output.reduce((sum, item) => sum + (Number(item.value) || 0), 0),
+    unassignedCount: Math.max(0, rows.length - assignmentCount)
+  };
+}
+
+function runAssignment(mode, rows, activeResources) {
+  const started = performance.now();
+  const { matrix, components } = makeMatrix(mode, rows, activeResources);
+  logAlgorithmCriteriaDiagnostics(mode, matrix, activeResources.length);
+  const assignment = hungarian(matrix);
+  const output = assignment.map((householdIndex, resourceIndex) => {
+    const household = rows[householdIndex];
+    return {
+      resource: formatAssignedResource(resourceIndex),
+      resourceIndex,
+      resourceName: resourceLabel(resourceIndex),
+      resourceType: resourceType(resourceIndex),
+      household,
+      value: matrix[resourceIndex][householdIndex],
+      distanceKm: distance(household),
+      components: components?.[resourceIndex]?.[householdIndex] || null
+    };
+  }).filter(item => item.household);
+  const durationMs = Math.max(.3, performance.now() - started);
+  const metrics = calculateAssignmentMetrics(output, rows);
+  return {
+    mode,
+    output,
+    cost: metrics.nativeCost,
+    totalDistance: metrics.totalDistance,
+    meanDistance: metrics.meanDistance,
+    maxDistance: metrics.maxDistance,
+    priorityMatches: metrics.highUrgencyCorrect,
+    accuracy: metrics.allocationAccuracy,
+    prioritization: metrics.prioritizationEfficiency,
+    duration: durationMs.toFixed(2),
+    durationMs,
+    dataset: state.filename,
+    records: rows.length,
+    resourceCount: activeResources.length,
+    matrixRows: activeResources.length,
+    matrixColumns: rows.length,
+    matrixSize: `${activeResources.length} x ${rows.length}`,
+    metrics,
+    weights: { ...state.weights }
+  };
 }
 
 function logAlgorithmCriteriaDiagnostics(mode, matrix, activeResourceCount) {
@@ -384,32 +572,25 @@ function execute(mode) {
     go('dataset');
     return null;
   }
-  const started = performance.now();
-  const { matrix, components, activeResources } = makeMatrix(mode);
   const verifiedHouseholds = getVerifiedHouseholdSet();
-  logAlgorithmCriteriaDiagnostics(mode, matrix, activeResources.length);
-  const assignment = hungarian(matrix);
-  const output = assignment.map((householdIndex, resourceIndex) => ({
-    resource: `${resources[resourceIndex]} (${resourceType(resourceIndex)})`,
-    resourceIndex,
-    household: verifiedHouseholds[householdIndex],
-    value: matrix[resourceIndex][householdIndex],
-    distanceKm: distance(verifiedHouseholds[householdIndex]),
-    components: components?.[resourceIndex]?.[householdIndex] || null
-  }));
-  const cost = output.reduce((sum, item) => sum + item.value, 0);
-  const totalDistance = output.reduce((sum, item) => sum + item.distanceKm, 0);
-  const compatible = output.filter(item => isCompatible(item.household, item.resourceIndex)).length;
-  const urgent = output.filter(item => Number(item.household.urgency) >= 7);
-  const priorityMatches = urgent.filter(item => isCompatible(item.household, item.resourceIndex)).length;
-  const accuracy = output.length ? compatible / output.length : 0;
-  const prioritization = urgent.length ? priorityMatches / urgent.length : 0;
-  const meanDistance = output.length ? totalDistance / output.length : 0;
-  const maxDistance = output.length ? Math.max(...output.map(item => item.distanceKm)) : 0;
-  const result = { mode, output, cost, totalDistance, meanDistance, maxDistance, priorityMatches, accuracy, prioritization, duration: Math.max(.3, performance.now() - started).toFixed(2), dataset: state.filename, records: verifiedHouseholds.length };
+  const activeResources = getActiveResources(verifiedHouseholds);
+  const result = runAssignment(mode, verifiedHouseholds, activeResources);
   state.latest = result;
   state.results[mode] = result;
   state.history.unshift({ id: `RUN-${String(Date.now()).slice(-5)}`, mode, dataset: state.filename, records: verifiedHouseholds.length, duration: result.duration, timestamp: new Date().toLocaleString() });
+  state.history = state.history.slice(0, 20);
+  localStorage.setItem('allocation-history', JSON.stringify(state.history));
+  logAllocationDiagnostics(`${mode} algorithm output`, result);
+  renderResult(result);
+  renderHistory();
+  return result;
+}
+
+function executeShared(mode, rows, activeResources) {
+  const result = runAssignment(mode, rows, activeResources);
+  state.latest = result;
+  state.results[mode] = result;
+  state.history.unshift({ id: `RUN-${String(Date.now()).slice(-5)}`, mode, dataset: state.filename, records: rows.length, duration: result.duration, timestamp: new Date().toLocaleString() });
   state.history = state.history.slice(0, 20);
   localStorage.setItem('allocation-history', JSON.stringify(state.history));
   logAllocationDiagnostics(`${mode} algorithm output`, result);
@@ -463,6 +644,255 @@ function compare() {
   draw(enhanced, '#compare-enhanced-list');
 }
 function renderHistory() { $('#history-list').innerHTML = state.history.length ? state.history.map(run => `<div class="history-row"><span>${run.id}</span><span>${run.mode === 'existing' ? 'Existing' : 'Enhanced'}</span><span>${run.dataset}</span><span>${run.records}</span><span>${run.duration} ms</span><span>Complete</span></div>`).join('') : '<div class="empty-output"><span>↺</span><p>No runs recorded yet.</p></div>'; }
+renderResult = function (result) {
+  const target = result.mode === 'existing' ? '#existing-output' : '#enhanced-output';
+  const metrics = result.mode === 'existing' ? '#existing-metrics' : '#enhanced-metrics';
+  $(target).className = 'result-list';
+  $(target).innerHTML = result.output.map(item => {
+    const summary = result.mode === 'existing'
+      ? `distance ${formatDistanceKm(item.distanceKm)}; basis distance only`
+      : `urgency ${escapeHtml(item.household.urgency)}; weighted cost ${round(item.value, 3)}`;
+    return `<div class="result-row"><span>${escapeHtml(item.resource)} <b>&rarr;</b> ${escapeHtml(item.household.household_id)}</span><small>${summary}</small></div>`;
+  }).join('');
+  if (result.mode === 'existing') {
+    $(metrics).innerHTML = `<div class="metric-section-title"><span>Optimization criterion</span><strong>Distance only</strong></div><div><span>Total distance cost</span><strong>${formatDistanceKm(result.cost)}</strong></div><div><span>Mean assignment distance</span><strong>${formatDistanceKm(result.meanDistance)}</strong></div><div><span>Maximum assignment distance</span><strong>${formatDistanceKm(result.maxDistance)}</strong></div><div><span>Number of assignments</span><strong>${result.output.length}</strong></div><div><span>Execution time</span><strong>${formatDurationMs(result.durationMs)}</strong></div><div class="metric-section-note"><span>Evaluation metrics only</span><small>Compatibility and priority are measured after assignment; they do not affect the Standard Hungarian result.</small></div><div><span>Compatibility rate</span><strong>${formatPercent(result.metrics.compatibilityRate)}</strong></div><div><span>Prioritization efficiency</span><strong>${formatCoefficient(result.metrics.prioritizationEfficiency)}</strong></div>`;
+  } else {
+    $(metrics).innerHTML = `<div><span>Total weighted cost</span><strong>${round(result.cost, 3)}</strong></div><div><span>Total assignment distance</span><strong>${formatDistanceKm(result.totalDistance)}</strong></div><div><span>Mean allocation accuracy</span><strong>${formatPercent(result.metrics.allocationAccuracy)}</strong></div><div><span>Prioritization efficiency</span><strong>${formatCoefficient(result.metrics.prioritizationEfficiency)}</strong></div><div><span>Execution time</span><strong>${formatDurationMs(result.durationMs)}</strong></div>`;
+  }
+  $(`#${result.mode}-status`).textContent = 'Complete';
+  $('#stat-latest').textContent = result.mode === 'existing' ? 'Baseline' : 'Enhanced';
+  $('#stat-latest-detail').textContent = `${formatDurationMs(result.durationMs)}; ${result.records} verified records`;
+  $('#dashboard-output').className = 'result-list';
+  $('#dashboard-output').innerHTML = result.output.slice(0, 5).map(item => `<div class="result-row"><span>${escapeHtml(item.resource)} <b>&rarr;</b> ${escapeHtml(item.household.household_id)}</span><small>${round(item.value, result.mode === 'existing' ? 2 : 3)}</small></div>`).join('');
+};
+
+function renderComparisonTable(rows) {
+  return `<div class="table-wrap compare-table-wrap"><table class="compare-table"><thead><tr><th>Metric</th><th>Standard</th><th>Enhanced</th><th>Difference</th></tr></thead><tbody>${rows.map(row => `<tr><td>${escapeHtml(row.metric)}</td><td>${row.standard}</td><td>${row.enhanced}</td><td>${row.difference}</td></tr>`).join('')}</tbody></table></div>`;
+}
+
+function compareHigherBetter(standard, enhanced) {
+  if (!isFiniteNumber(standard) || !isFiniteNumber(enhanced)) return 'Requires varied data';
+  if (Number(enhanced) > Number(standard)) return 'Enhanced better';
+  if (Number(standard) > Number(enhanced)) return 'Standard better';
+  return 'Tie';
+}
+
+function compareLowerBetter(standard, enhanced) {
+  if (!isFiniteNumber(standard) || !isFiniteNumber(enhanced)) return 'Requires data';
+  if (Number(enhanced) < Number(standard)) return 'Enhanced better';
+  if (Number(standard) < Number(enhanced)) return 'Standard better';
+  return 'Tie';
+}
+
+function getHighUrgencyServiceRate(result) {
+  const total = result?.metrics?.highUrgencyTotal;
+  return total ? result.metrics.highUrgencyCorrect / total : null;
+}
+
+function formatHighUrgencyServed(result) {
+  const total = result?.metrics?.highUrgencyTotal;
+  if (!total) return 'No high-urgency H*';
+  return `${result.metrics.highUrgencyCorrect} / ${total}`;
+}
+
+function compareHighUrgencyPriority(standard, enhanced) {
+  const standardRate = getHighUrgencyServiceRate(standard);
+  const enhancedRate = getHighUrgencyServiceRate(enhanced);
+  return compareHigherBetter(standardRate, enhancedRate);
+}
+
+function formatHighUrgencyChange(standard, enhanced) {
+  const standardRate = getHighUrgencyServiceRate(standard);
+  const enhancedRate = getHighUrgencyServiceRate(enhanced);
+  if (!isFiniteNumber(standardRate) || !isFiniteNumber(enhancedRate)) return 'Requires high-urgency H*';
+  const countDiff = enhanced.metrics.highUrgencyCorrect - standard.metrics.highUrgencyCorrect;
+  return `${formatHighUrgencyServed(standard)} -> ${formatHighUrgencyServed(enhanced)} (${formatSignedInteger(countDiff)} households; ${formatPercentagePoint(enhancedRate - standardRate)})`;
+}
+
+function formatCoefficientChange(standard, enhanced) {
+  if (!isFiniteNumber(standard) || !isFiniteNumber(enhanced)) return 'Requires varied data';
+  return `${formatCoefficient(standard)} -> ${formatCoefficient(enhanced)}`;
+}
+
+function compareFasterInThisRun(standardMs, enhancedMs) {
+  if (!isFiniteNumber(standardMs) || !isFiniteNumber(enhancedMs)) return 'Requires data';
+  if (Number(enhancedMs) < Number(standardMs)) return 'Enhanced faster in this run';
+  if (Number(standardMs) < Number(enhancedMs)) return 'Standard faster in this run';
+  return 'Tie in this run';
+}
+
+function assignmentLabel(item) {
+  return item ? item.resource : 'Unassigned';
+}
+
+function assignmentCompatibilityLabel(item) {
+  if (!item) return 'Unassigned';
+  return isAssignedCompatible(item) ? 'Match' : 'Mismatch';
+}
+
+function buildHouseholdComparisonRows(rows, existing, enhanced) {
+  const existingMaps = getResultAssignmentMaps(existing);
+  const enhancedMaps = getResultAssignmentMaps(enhanced);
+  return rows.map((household, index) => {
+    const standard = getResultAssignmentForRow(existing, household, existingMaps);
+    const enhancedAssignment = getResultAssignmentForRow(enhanced, household, enhancedMaps);
+    const standardKey = standard ? standard.resourceIndex : null;
+    const enhancedKey = enhancedAssignment ? enhancedAssignment.resourceIndex : null;
+    const changed = standardKey !== enhancedKey;
+    const corrected = changed && standard && enhancedAssignment && !isAssignedCompatible(standard) && isAssignedCompatible(enhancedAssignment);
+    return {
+      index,
+      household,
+      standard,
+      enhanced: enhancedAssignment,
+      changed,
+      corrected,
+      label: corrected ? 'Yes - corrected mismatch' : changed ? 'Yes' : 'No'
+    };
+  });
+}
+
+function renderHouseholdComparisonTable(rows) {
+  return `<div class="table-wrap household-compare-wrap"><table class="compare-table household-compare-table" id="household-change-table"><thead><tr><th>Household</th><th>Urgency</th><th>Required Resource</th><th>Standard Assignment</th><th>Standard Distance</th><th>Standard Compatibility</th><th>Enhanced Assignment</th><th>Enhanced Distance</th><th>Enhanced Compatibility</th><th>Changed?</th></tr></thead><tbody>${rows.map(row => {
+    const attrs = row.changed ? ` data-change-index="${row.index}" tabindex="0"` : '';
+    return `<tr class="household-change-row${row.changed ? ' is-changed' : ''}"${attrs}><td>${escapeHtml(getHouseholdId(row.household) || row.household.household_id || `H* ${row.index + 1}`)}</td><td>${escapeHtml(row.household.urgency)}</td><td>${escapeHtml(row.household.compatible_resource || 'N/A')}</td><td>${escapeHtml(assignmentLabel(row.standard))}</td><td>${formatDistanceKm(row.standard?.distanceKm)}</td><td>${assignmentCompatibilityLabel(row.standard)}</td><td>${escapeHtml(assignmentLabel(row.enhanced))}</td><td>${formatDistanceKm(row.enhanced?.distanceKm)}</td><td>${assignmentCompatibilityLabel(row.enhanced)}</td><td>${escapeHtml(row.label)}</td></tr>`;
+  }).join('')}</tbody></table></div>`;
+}
+
+function renderHouseholdChangeDetail(row) {
+  if (!row) return '<p class="compare-note">No assignment changes were produced by the current Standard and Enhanced outputs.</p>';
+  const standard = row.standard;
+  const enhanced = row.enhanced;
+  return `<div class="change-detail-grid"><div><span>Household</span><strong>${escapeHtml(getHouseholdId(row.household) || row.household.household_id || `H* ${row.index + 1}`)}</strong></div><div><span>Required resource</span><strong>${escapeHtml(row.household.compatible_resource || 'N/A')}</strong></div><div><span>Urgency</span><strong>${escapeHtml(row.household.urgency)}</strong></div></div><div class="change-detail-columns"><section><h4>STANDARD</h4><div class="change-detail-line"><span>Assignment</span><strong>${escapeHtml(assignmentLabel(standard))}</strong></div><div class="change-detail-line"><span>Distance</span><strong>${formatDistanceKm(standard?.distanceKm, 3)}</strong></div><div class="change-detail-line"><span>Decision basis</span><strong>Distance only</strong></div></section><section><h4>ENHANCED</h4><div class="change-detail-line"><span>Assignment</span><strong>${escapeHtml(assignmentLabel(enhanced))}</strong></div><div class="change-detail-line"><span>Distance component</span><strong>${round(enhanced?.components?.distanceComponent, 3)}</strong></div><div class="change-detail-line"><span>Urgency component</span><strong>${round(enhanced?.components?.urgencyComponent, 3)}</strong></div><div class="change-detail-line"><span>Compatibility component</span><strong>${round(enhanced?.components?.compatibilityComponent, 3)}</strong></div><div class="change-detail-line"><span>Composite cost</span><strong>${round(enhanced?.value, 3)}</strong></div></section></div>`;
+}
+
+function bindComparisonReport(rows) {
+  const detail = $('#change-detail-content');
+  if (!detail) return;
+  const changedRows = rows.filter(row => row.changed);
+  const buttons = Array.from(document.querySelectorAll('#household-change-table [data-change-index]'));
+  const selectRow = selected => {
+    detail.innerHTML = renderHouseholdChangeDetail(selected);
+    buttons.forEach(button => button.classList.toggle('is-selected', Number(button.dataset.changeIndex) === selected.index));
+  };
+  buttons.forEach(button => {
+    const row = rows[Number(button.dataset.changeIndex)];
+    button.addEventListener('click', () => selectRow(row));
+    button.addEventListener('keydown', event => {
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      event.preventDefault();
+      selectRow(row);
+    });
+  });
+  if (changedRows.length) selectRow(changedRows[0]);
+  else detail.innerHTML = renderHouseholdChangeDetail(null);
+}
+
+function buildBenchmarkRows(rows) {
+  return BENCHMARK_MATRIX_SIZES.map(size => {
+    if (rows.length < size) return { size, status: `Needs ${size} verified H*; current H* is ${rows.length}`, standard: null, enhanced: null };
+    const benchmarkRows = rows.slice(0, size);
+    const benchmarkResources = getActiveResources(benchmarkRows, size);
+    return {
+      size,
+      status: 'Complete',
+      standard: runAssignment('existing', benchmarkRows, benchmarkResources),
+      enhanced: runAssignment('enhanced', benchmarkRows, benchmarkResources)
+    };
+  });
+}
+
+function renderBenchmarkTable(rows) {
+  const benchmarks = buildBenchmarkRows(rows);
+  return `<div class="table-wrap benchmark-wrap"><table class="compare-table benchmark-table"><thead><tr><th>Matrix Size</th><th>Status</th><th>Standard Time</th><th>Enhanced Time</th><th>Standard Accuracy</th><th>Enhanced Accuracy</th><th>Standard Urgency-Compat r</th><th>Enhanced Urgency-Compat r</th><th>Standard Cost</th><th>Enhanced Cost</th><th>Standard Distance</th><th>Enhanced Distance</th></tr></thead><tbody>${benchmarks.map(row => `<tr><td>${row.size}x${row.size}</td><td>${escapeHtml(row.status)}</td><td>${formatDurationMs(row.standard?.durationMs)}</td><td>${formatDurationMs(row.enhanced?.durationMs)}</td><td>${formatPercent(row.standard?.metrics.allocationAccuracy)}</td><td>${formatPercent(row.enhanced?.metrics.allocationAccuracy)}</td><td>${formatCoefficient(row.standard?.metrics.prioritizationEfficiency)}</td><td>${formatCoefficient(row.enhanced?.metrics.prioritizationEfficiency)}</td><td>${row.standard ? formatDistanceKm(row.standard.cost) : 'N/A'}</td><td>${row.enhanced ? round(row.enhanced.cost, 3) : 'N/A'}</td><td>${formatDistanceKm(row.standard?.totalDistance)}</td><td>${formatDistanceKm(row.enhanced?.totalDistance)}</td></tr>`).join('')}</tbody></table></div>`;
+}
+
+function renderTradeoffSummary(existing, enhanced) {
+  const rows = [
+    { label: 'Distance Efficiency', outcome: compareLowerBetter(existing.metrics.meanDistance, enhanced.metrics.meanDistance), detail: `${formatDistanceKm(existing.metrics.meanDistance)} vs ${formatDistanceKm(enhanced.metrics.meanDistance)}` },
+    { label: 'Compatibility', outcome: compareHigherBetter(existing.metrics.compatibilityRate, enhanced.metrics.compatibilityRate), detail: `${formatPercent(existing.metrics.compatibilityRate)} vs ${formatPercent(enhanced.metrics.compatibilityRate)}` },
+    { label: 'Prioritization', outcome: compareHighUrgencyPriority(existing, enhanced), detail: `${formatHighUrgencyServed(existing)} vs ${formatHighUrgencyServed(enhanced)}` },
+    { label: 'Execution Time', outcome: compareFasterInThisRun(existing.durationMs, enhanced.durationMs), detail: `${formatDurationMs(existing.durationMs)} vs ${formatDurationMs(enhanced.durationMs)}` }
+  ];
+  return `<div class="tradeoff-list">${rows.map(row => `<div><span>${escapeHtml(row.label)}</span><strong>${escapeHtml(row.outcome)}</strong><small>${escapeHtml(row.detail)}</small></div>`).join('')}</div>`;
+}
+
+function renderInterpretations(existing, enhanced, changedCount, rows) {
+  const compatibilityDiff = enhanced.metrics.compatibilityRate - existing.metrics.compatibilityRate;
+  const accuracyDiff = enhanced.metrics.allocationAccuracy - existing.metrics.allocationAccuracy;
+  const distanceDiff = enhanced.metrics.meanDistance - existing.metrics.meanDistance;
+  const timeDiff = enhanced.durationMs - existing.durationMs;
+  const standardHighUrgencyRate = getHighUrgencyServiceRate(existing);
+  const enhancedHighUrgencyRate = getHighUrgencyServiceRate(enhanced);
+  const highUrgencyDiff = isFiniteNumber(standardHighUrgencyRate) && isFiniteNumber(enhancedHighUrgencyRate)
+    ? enhancedHighUrgencyRate - standardHighUrgencyRate
+    : null;
+  const distanceDirection = isFiniteNumber(distanceDiff) && Math.abs(distanceDiff) > 0.0005
+    ? Number(distanceDiff) > 0 ? `accepted ${formatDistanceKm(Math.abs(distanceDiff))} longer mean physical distance` : `reduced mean physical distance by ${formatDistanceKm(Math.abs(distanceDiff))}`
+    : 'kept mean physical distance unchanged';
+  const urgencyDirection = isFiniteNumber(highUrgencyDiff) && Math.abs(highUrgencyDiff) > 0.0005
+    ? Number(highUrgencyDiff) > 0 ? `improved high-urgency service by ${formatAbsolutePercentagePoint(highUrgencyDiff)}` : `reduced high-urgency service by ${formatAbsolutePercentagePoint(highUrgencyDiff)}`
+    : isFiniteNumber(highUrgencyDiff) ? 'left high-urgency service unchanged' : 'could not evaluate high-urgency service';
+  const compatibilityDirection = isFiniteNumber(compatibilityDiff) && Math.abs(compatibilityDiff) > 0.0005
+    ? Number(compatibilityDiff) > 0 ? `improved compatibility by ${formatAbsolutePercentagePoint(compatibilityDiff)}` : `reduced compatibility by ${formatAbsolutePercentagePoint(compatibilityDiff)}`
+    : 'left compatibility unchanged';
+  const statements = [
+    `Enhanced changed ${changedCount} of ${rows.length} H* assignment decisions (${formatPercent(rows.length ? changedCount / rows.length : null)}).`,
+    `Enhanced changed compatibility from ${formatPercent(existing.metrics.compatibilityRate)} to ${formatPercent(enhanced.metrics.compatibilityRate)}, a change of ${formatPercentagePoint(compatibilityDiff)}.`,
+    `Enhanced changed mean allocation accuracy from ${formatPercent(existing.metrics.allocationAccuracy)} to ${formatPercent(enhanced.metrics.allocationAccuracy)}, a change of ${formatPercentagePoint(accuracyDiff)}.`,
+    `High-urgency households correctly served changed from ${formatHighUrgencyServed(existing)} to ${formatHighUrgencyServed(enhanced)}, a change of ${isFiniteNumber(highUrgencyDiff) ? formatPercentagePoint(highUrgencyDiff) : 'N/A'}.`,
+    `Enhanced changed mean physical distance from ${formatDistanceKm(existing.metrics.meanDistance)} to ${formatDistanceKm(enhanced.metrics.meanDistance)}, a difference of ${formatSignedNumber(distanceDiff, 2, ' km')}.`,
+    `Enhanced changed execution time from ${formatDurationMs(existing.durationMs)} to ${formatDurationMs(enhanced.durationMs)}, a difference of ${formatSignedNumber(timeDiff, 2, ' ms')}.`,
+    isFiniteNumber(existing.metrics.prioritizationEfficiency) && isFiniteNumber(enhanced.metrics.prioritizationEfficiency)
+      ? `Urgency-compatibility Spearman correlation changed from ${formatCoefficientChange(existing.metrics.prioritizationEfficiency, enhanced.metrics.prioritizationEfficiency)}.`
+      : 'Urgency-compatibility Spearman correlation requires varied urgency and compatibility outcomes in the current assignments.',
+    `Standard optimizes distance only. Enhanced uses the weighted distance, urgency, and compatibility objective; in this run it ${distanceDirection}, ${urgencyDirection}, and ${compatibilityDirection}.`
+  ];
+  return `<div class="interpretation-list">${statements.map(statement => `<p>${escapeHtml(statement)}</p>`).join('')}<p>Native assignment costs are reported in their own units: Standard uses distance-only kilometers; Enhanced uses composite weighted cost.</p></div>`;
+}
+
+function renderComparisonReport(existing, enhanced, rows, activeResources) {
+  const householdRows = buildHouseholdComparisonRows(rows, existing, enhanced);
+  const changedCount = householdRows.filter(row => row.changed).length;
+  const compatibilityDiff = enhanced.metrics.compatibilityRate - existing.metrics.compatibilityRate;
+  const prioritizationCorrelationChange = formatCoefficientChange(existing.metrics.prioritizationEfficiency, enhanced.metrics.prioritizationEfficiency);
+  const objectiveOneRows = [
+    { metric: 'Mean Allocation Accuracy', standard: formatPercent(existing.metrics.allocationAccuracy), enhanced: formatPercent(enhanced.metrics.allocationAccuracy), difference: formatPercentagePoint(enhanced.metrics.allocationAccuracy - existing.metrics.allocationAccuracy) },
+    { metric: 'Compatibility Rate', standard: formatPercent(existing.metrics.compatibilityRate), enhanced: formatPercent(enhanced.metrics.compatibilityRate), difference: formatPercentagePoint(compatibilityDiff) },
+    { metric: 'Compatible Assignments', standard: `${existing.metrics.compatibleAssignments} / ${existing.metrics.assignmentCount}`, enhanced: `${enhanced.metrics.compatibleAssignments} / ${enhanced.metrics.assignmentCount}`, difference: formatSignedInteger(enhanced.metrics.compatibleAssignments - existing.metrics.compatibleAssignments) },
+    { metric: 'Mismatch Count', standard: String(existing.metrics.mismatchCount), enhanced: String(enhanced.metrics.mismatchCount), difference: formatSignedInteger(enhanced.metrics.mismatchCount - existing.metrics.mismatchCount) },
+    { metric: 'High-Urgency Households Correctly Served', standard: `${existing.metrics.highUrgencyCorrect} / ${existing.metrics.highUrgencyTotal}`, enhanced: `${enhanced.metrics.highUrgencyCorrect} / ${enhanced.metrics.highUrgencyTotal}`, difference: formatSignedInteger(enhanced.metrics.highUrgencyCorrect - existing.metrics.highUrgencyCorrect) },
+    { metric: 'Mean Physical Distance', standard: formatDistanceKm(existing.metrics.meanDistance), enhanced: formatDistanceKm(enhanced.metrics.meanDistance), difference: formatSignedNumber(enhanced.metrics.meanDistance - existing.metrics.meanDistance, 2, ' km') }
+  ];
+  const objectiveThreeRows = [
+    { metric: 'Total Assignment Cost (native objective)', standard: formatDistanceKm(existing.cost), enhanced: round(enhanced.cost, 3), difference: 'Different scales' },
+    { metric: 'Total Physical Distance', standard: formatDistanceKm(existing.metrics.totalDistance), enhanced: formatDistanceKm(enhanced.metrics.totalDistance), difference: formatSignedNumber(enhanced.metrics.totalDistance - existing.metrics.totalDistance, 2, ' km') },
+    { metric: 'Mean Physical Distance', standard: formatDistanceKm(existing.metrics.meanDistance), enhanced: formatDistanceKm(enhanced.metrics.meanDistance), difference: formatSignedNumber(enhanced.metrics.meanDistance - existing.metrics.meanDistance, 2, ' km') },
+    { metric: 'Mean Allocation Accuracy', standard: formatPercent(existing.metrics.allocationAccuracy), enhanced: formatPercent(enhanced.metrics.allocationAccuracy), difference: formatPercentagePoint(enhanced.metrics.allocationAccuracy - existing.metrics.allocationAccuracy) },
+    { metric: 'Urgency-Compatibility Correlation (Spearman)', standard: formatCoefficient(existing.metrics.prioritizationEfficiency), enhanced: formatCoefficient(enhanced.metrics.prioritizationEfficiency), difference: prioritizationCorrelationChange },
+    { metric: 'Execution Time', standard: formatDurationMs(existing.durationMs), enhanced: formatDurationMs(enhanced.durationMs), difference: formatSignedNumber(enhanced.durationMs - existing.durationMs, 2, ' ms') }
+  ];
+  $('#compare-content').innerHTML = `<section class="panel compare-section"><div class="panel-head"><div><p class="eyebrow">Experiment summary</p><h3>Shared controlled inputs</h3></div></div><div class="compare-summary-grid"><div><span>Dataset</span><strong>${escapeHtml(state.filename || 'Uploaded dataset')}</strong></div><div><span>Verified H* count</span><strong>${rows.length}</strong></div><div><span>Resource count</span><strong>${activeResources.length}</strong></div><div><span>Matrix size</span><strong>${existing.matrixSize}</strong></div><div><span>Standard</span><strong>Distance Only</strong></div><div><span>Enhanced</span><strong>Distance + Urgency + Compatibility</strong></div><div><span>Shared hub</span><strong>${escapeHtml(RELIEF_HUB.name)}</strong></div><div><span>Shared coordinate source</span><strong>${rows.filter(hasValidCoordinates).length} H* coordinates</strong></div></div></section><section class="panel compare-section"><div class="panel-head"><div><p class="eyebrow">SOP / Objective 1</p><h3>Multi-criteria allocation effect</h3></div></div>${renderComparisonTable(objectiveOneRows)}</section><section class="panel compare-section"><div class="panel-head"><div><p class="eyebrow">SOP / Objective 2</p><h3>Weighted cost matrix effect</h3></div></div><div class="compare-effect-grid"><div><span>Enhanced weights</span><strong>D ${round(enhanced.weights.distance, 3)}; U ${round(enhanced.weights.urgency, 3)}; C ${round(enhanced.weights.compatibility, 3)}</strong></div><div><span>Assignments changed</span><strong>${changedCount}</strong></div><div><span>Assignment change rate</span><strong>${formatPercent(rows.length ? changedCount / rows.length : null)}</strong></div><div><span>Compatibility improvement</span><strong>${formatPercentagePoint(compatibilityDiff)}</strong></div><div><span>High-urgency served change</span><strong>${formatHighUrgencyChange(existing, enhanced)}</strong></div></div>${renderHouseholdComparisonTable(householdRows)}<section class="change-detail-panel"><div class="panel-head"><div><p class="eyebrow">Household change details</p><h3>Selected changed assignment</h3></div></div><div id="change-detail-content"></div></section></section><section class="panel compare-section"><div class="panel-head"><div><p class="eyebrow">SOP / Objective 3</p><h3>Computational performance</h3></div></div>${renderComparisonTable(objectiveThreeRows)}<p class="compare-note">Standard distance cost and Enhanced weighted cost are displayed as native objective costs only; direct comparison uses physical distance, accuracy, high-urgency service, compatibility, and execution time. The Spearman row is a correlation diagnostic, not a deviation/penalty score.</p></section><section class="panel compare-section"><div class="panel-head"><div><p class="eyebrow">Trade-off summary</p><h3>Current run interpretation</h3></div></div>${renderTradeoffSummary(existing, enhanced)}${renderInterpretations(existing, enhanced, changedCount, rows)}</section><section class="panel compare-section"><div class="panel-head"><div><p class="eyebrow">Matrix-size performance</p><h3>Benchmark from current H*</h3></div></div>${renderBenchmarkTable(rows)}</section>`;
+  bindComparisonReport(householdRows);
+}
+
+compare = function () {
+  const blockers = [...getRunBlockers('existing'), ...getRunBlockers('enhanced')];
+  if (blockers.length) {
+    toast(blockers[0]);
+    go('dataset');
+    return;
+  }
+  const verifiedHouseholds = getVerifiedHouseholdSet();
+  const activeResources = getActiveResources(verifiedHouseholds);
+  const existing = executeShared('existing', verifiedHouseholds, activeResources);
+  const enhanced = executeShared('enhanced', verifiedHouseholds, activeResources);
+  if (!existing || !enhanced) return;
+  $('#compare-empty').classList.add('hidden');
+  $('#compare-content').classList.remove('hidden');
+  renderComparisonReport(existing, enhanced, verifiedHouseholds, activeResources);
+};
+
 function bind() { document.querySelectorAll('[data-page]').forEach(item => item.addEventListener('click', event => { event.preventDefault(); go(item.dataset.page); })); document.querySelectorAll('[data-page-target]').forEach(item => item.addEventListener('click', () => go(item.dataset.pageTarget))); document.querySelectorAll('[data-run]').forEach(item => item.addEventListener('click', () => { if (item.dataset.run === 'both') { compare(); go('compare'); } else { execute(item.dataset.run); go(item.dataset.run); } })); $('#file-input').addEventListener('change', event => loadFile(event.target.files[0])); $('#table-search').addEventListener('input', renderTable); $('#clear-history').addEventListener('click', () => { state.history = []; localStorage.removeItem('allocation-history'); renderHistory(); toast('History cleared'); }); }
 function initializeApp() {
   bind();
@@ -1720,7 +2150,7 @@ function renderComparisonMaps() {
     panel.id = 'comparison-map-panel';
     panel.className = 'panel comparison-map-panel';
     panel.innerHTML = `<div class="panel-head"><div><p class="eyebrow">Geographic comparison</p><h3>Standard distance baseline vs enhanced weighted model</h3></div></div><div class="comparison-map-grid"><div><div class="comparison-map-head"><h4>Standard Hungarian · distance only</h4><div class="map-legend" aria-label="Standard distance-only legend">${EXISTING_MAP_LEGEND}</div></div><div id="compare-existing-map" class="relief-map"></div></div><div><div class="comparison-map-head"><h4>Enhanced Hungarian · distance + urgency + compatibility</h4><div class="map-legend" aria-label="Enhanced priority legend">${MAP_LEGEND}</div></div><div id="compare-enhanced-map" class="relief-map"></div></div></div><div class="map-foot"><span>Click a household marker to inspect its assignment. Lines are not routes.</span><strong>Same Barangay 160 research area</strong></div>`;
-    $('#view-compare').insertBefore(panel, $('#compare-content'));
+    $('#view-compare').appendChild(panel);
   }
   ['existing', 'enhanced'].forEach(target => renderComparisonMap(state.results[target] || null, target));
 }
