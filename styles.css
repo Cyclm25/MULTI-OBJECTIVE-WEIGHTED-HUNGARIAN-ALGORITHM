@@ -28,6 +28,7 @@
 .map-legend .priority-dot { background: #c58a45; }
 .map-legend .routine-dot { background: #59799d; }
 .map-legend .household-dot { background: #29496b; }
+.map-legend .resource-source-dot { background: #7b8d45; }
 .map-legend .unassigned-dot { background: rgba(41,73,107,.42); border-color: #29496b; }
 .map-legend .pending-dot { background: #fff; border-color: #748397; }
 .map-legend .assignment-line { width: 18px; height: 0; border: 0; border-top: 2px solid #29496b; border-radius: 0; background: transparent; box-shadow: none; }
@@ -48,6 +49,7 @@ body.assignment-map-expanded { overflow: hidden; }
 .comparison-map-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin: 0 0 10px; }
 .comparison-map-grid h4 { margin: 0; color: var(--ink); font-size: 13px; }
 .leaflet-container { font-family: var(--sans); }
+.map-run-summary { padding: 6px 9px; border: 1px solid rgba(41,73,107,.16); border-radius: 8px; background: rgba(255,255,255,.9); color: #29496b; box-shadow: 0 7px 18px rgba(23,43,70,.12); font: 10px var(--mono); }
 .leaflet-control-zoom { overflow: hidden; border: 0 !important; border-radius: 10px !important; box-shadow: 0 7px 24px rgba(23,43,70,.16) !important; }
 .leaflet-control-zoom a { width: 34px !important; height: 34px !important; border-color: #e3eaf1 !important; color: #29496b !important; line-height: 34px !important; }
 .leaflet-control-attribution { padding: 3px 7px !important; border-radius: 8px 0 0 0; background: rgba(255,255,255,.82) !important; color: #748397; backdrop-filter: blur(8px); }
@@ -184,12 +186,28 @@ h3, h4 { margin: 0; font-weight: 700; letter-spacing: -.025em; }
 .download-link { display: inline-flex; align-items: center; justify-content: center; text-decoration: none; }
 .upload-button { position: relative; }
 .upload-button input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+.comparison-actions { display: flex; align-items: stretch; gap: 10px; }
+.matrix-size-control { display: grid; gap: 6px; min-width: 132px; }
+.matrix-size-control span { color: var(--muted); font: 500 9px var(--mono); letter-spacing: .06em; text-transform: uppercase; }
+.matrix-size-control select { height: 100%; min-height: 39px; padding: 8px 10px; border: 1px solid #bfcac1; border-radius: 2px; background: #fff; color: var(--forest); font: 700 11px var(--sans); }
 .upload-panel { display: flex; align-items: center; gap: 20px; padding: 27px; border: 1px dashed #bfcac1; background: #f7f9f6; color: var(--muted); }
 .upload-panel h3 { color: var(--ink); font-size: 16px; }
 .upload-panel p { margin: 5px 0 0; font-size: 11px; }
 .upload-icon { display: grid; place-items: center; width: 41px; height: 41px; border-radius: 2px; background: var(--forest); color: #fff; font-size: 23px; }
 .upload-hint { margin-left: auto; }
-.mapping-panel, .validation-panel { margin-top: 12px; }
+.mapping-panel, .validation-panel, .resource-panel { margin-top: 12px; }
+.import-readiness { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0; margin-bottom: 14px; border: 1px solid var(--line); border-radius: 2px; overflow: hidden; }
+.import-readiness > div { min-width: 0; padding: 13px 14px; border-right: 1px solid var(--line); background: #fff; }
+.import-readiness > div:last-child { border-right: 0; }
+.import-readiness span { display: block; color: var(--muted); font: 500 9px var(--mono); letter-spacing: .04em; text-transform: uppercase; }
+.import-readiness strong { display: block; overflow-wrap: anywhere; margin-top: 5px; color: var(--ink); font-size: 14px; line-height: 1.35; }
+.validation-actions { display: flex; flex-wrap: wrap; gap: 9px; margin: 0 0 14px; }
+.validation-actions button:disabled { opacity: .55; cursor: not-allowed; }
+.matrix-readiness { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 0; }
+.matrix-readiness span { padding: 5px 8px; border: 1px solid var(--line); border-radius: 2px; background: #fff; font: 700 10px var(--mono); }
+.advanced-mapping { margin: -2px 0 14px; color: var(--muted); font-size: 11px; }
+.advanced-mapping summary { cursor: default; list-style: none; }
+.advanced-mapping summary::-webkit-details-marker { display: none; }
 .mapping-grid { display: grid; grid-template-columns: repeat(4, minmax(150px, 1fr)); gap: 12px; }
 .mapping-grid label { display: grid; gap: 6px; color: var(--muted); font: 500 10px var(--mono); text-transform: uppercase; }
 .mapping-grid select { width: 100%; padding: 9px 10px; border: 1px solid #cbd8e5; border-radius: 2px; background: #fff; color: var(--ink); font: 12px var(--sans); text-transform: none; }
@@ -200,11 +218,22 @@ h3, h4 { margin: 0; font-weight: 700; letter-spacing: -.025em; }
 .validation-summary-grid > div:nth-last-child(-n+3) { border-bottom: 0; }
 .validation-summary-grid span { display: block; color: var(--muted); font: 500 9px var(--mono); text-transform: uppercase; }
 .validation-summary-grid strong { display: block; margin-top: 4px; color: #29496b; font-size: 20px; }
+.compact-readiness { grid-template-columns: repeat(5, 1fr); }
+.compact-readiness > div:nth-child(3n) { border-right: 1px solid var(--line); }
+.compact-readiness > div:nth-child(5n) { border-right: 0; }
+.compact-readiness > div:nth-last-child(-n+5) { border-bottom: 0; }
 .validation-issues { display: grid; gap: 8px; margin-top: 14px; }
 .validation-issues.compact { display: flex; flex-wrap: wrap; gap: 8px; }
 .validation-issues.compact span, .validation-issue-row { padding: 9px 10px; border: 1px solid #ead4d4; border-radius: 2px; background: #fff8f8; color: #8d4747; font-size: 11px; }
 .validation-issue-row { display: grid; grid-template-columns: 110px minmax(0, 1fr); gap: 12px; }
 .validation-issue-row strong { color: #6f3434; }
+.validation-issues-table { min-width: 760px; }
+.row-details summary { cursor: pointer; color: var(--forest); font: 700 10px var(--mono); }
+.row-details-grid { display: grid; gap: 7px; min-width: 260px; padding: 10px 0 0; }
+.row-details-grid div { display: grid; grid-template-columns: 105px minmax(0, 1fr); gap: 8px; }
+.row-details-grid span { color: var(--muted); font: 500 9px var(--mono); text-transform: uppercase; }
+.row-details-grid strong { min-width: 0; overflow-wrap: anywhere; color: var(--ink); font-weight: 600; white-space: normal; }
+.assignment-output-table { min-width: 620px; }
 .data-summary, .compare-stats { display: grid; grid-template-columns: repeat(4, 1fr); margin-top: 22px; border: 1px solid var(--line); }
 .data-summary > div, .compare-stats > div { padding: 16px 18px; border-right: 1px solid var(--line); }
 .data-summary > div:last-child, .compare-stats > div:last-child { border-right: 0; }
@@ -217,7 +246,7 @@ th, td { padding: 11px 10px; border-bottom: 1px solid var(--line); text-align: l
 th { background: #f3f6f1; color: #65766b; font: 500 9px var(--mono); text-transform: uppercase; }
 .verified { color: #39734d; font: 10px var(--mono); }
 .valid { color: #39734d; font: 10px var(--mono); }
-.pending, .pending-verification, .pending-system-validation, .flagged, .flagged-verification, .provided-coordinates, .approximate, .needs-location-review, .location-review { color: #92723c; font: 10px var(--mono); }
+.pending, .pending-verification, .pending-system-validation, .flagged, .flagged-verification, .provided-coordinates, .approximate, .parent-address-match, .needs-review, .needs-location-review, .location-review, .geocoded { color: #92723c; font: 10px var(--mono); }
 .invalid, .rejected, .rejected-verification, .unresolved, .unresolved-location, .geocoding-service-unavailable, .outside-research-area, .not-eligible, .not-verified { color: #8d4747; font: 10px var(--mono); }
 .inside-research-area, .eligible-for-allocation { color: #39734d; font: 10px var(--mono); }
 .flagged { color: #92723c; font: 10px var(--mono); }
@@ -327,7 +356,7 @@ input[type=range]:disabled { cursor: not-allowed; opacity: .72; }
 	.welcome-row, .view-title { display: block; }
 	.welcome-row .primary-button, .view-title > .primary-button { margin-top: 20px; }
 	h2, .view-title h2 { font-size: 38px; }
-	.stat-grid, .data-summary, .compare-stats, .parameter-bar, .mapping-grid, .validation-summary-grid { grid-template-columns: 1fr 1fr; }
+	.stat-grid, .data-summary, .compare-stats, .parameter-bar, .mapping-grid, .validation-summary-grid, .import-readiness { grid-template-columns: 1fr 1fr; }
 	.validation-summary-grid > div:nth-child(3n) { border-right: 1px solid var(--line); }
 	.validation-summary-grid > div:nth-child(2n) { border-right: 0; }
 	.validation-summary-grid > div:nth-last-child(-n+3) { border-bottom: 1px solid var(--line); }
