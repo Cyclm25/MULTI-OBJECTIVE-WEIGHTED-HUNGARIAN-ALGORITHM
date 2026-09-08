@@ -313,7 +313,7 @@ function reportRunError(error, fallback = 'Run failed') {
   if (typeof console !== 'undefined') console.error('[Allocation Lab]', error);
   toast(error?.message || fallback);
 }
-function go(page) { document.querySelectorAll('.view').forEach(view => view.classList.toggle('active', view.id === `view-${page}`)); document.querySelectorAll('.nav-item[data-page]').forEach(item => item.classList.toggle('active', item.dataset.page === page)); const labels = { dashboard: 'Dashboard', dataset: 'Dataset', existing: 'Existing algorithm', enhanced: 'Enhanced algorithm', compare: 'Compare', history: 'Run history', settings: 'Settings' }; $('#page-title').textContent = labels[page]; $('#header-title').textContent = page === 'dashboard' ? 'Algorithm workspace' : labels[page]; window.scrollTo(0, 0); }
+function go(page) { if (!['existing', 'enhanced', 'compare'].includes(page)) page = 'compare'; document.querySelectorAll('.view').forEach(view => view.classList.toggle('active', view.id === `view-${page}`)); document.querySelectorAll('.nav-item[data-page]').forEach(item => item.classList.toggle('active', item.dataset.page === page)); const labels = { existing: 'Existing Algorithm', enhanced: 'Enhanced Algorithm', compare: 'Comparison' }; const titles = { existing: 'Standard Hungarian Algorithm - Distance-Only Baseline', enhanced: 'Enhanced Multi-Objective Weighted Hungarian Algorithm', compare: 'Research Comparison' }; $('#page-title').textContent = labels[page]; $('#header-title').textContent = titles[page]; window.scrollTo(0, 0); }
 function parseCsvRecords(text) {
   const rows = [];
   let row = [];
@@ -443,7 +443,7 @@ async function loadFile(file) {
         state.resourceFilename = '';
         state.resourceSource = '';
         renderDataset();
-        go('dataset');
+        go('compare');
         toast('Resources sheet not found');
         return;
       }
@@ -453,7 +453,7 @@ async function loadFile(file) {
     applyHouseholdImport(file.name, headers, rows);
     logAllocationDiagnostics(`${extension?.toUpperCase() || 'Dataset'} upload: ${file.name}`);
     renderDataset();
-    go('dataset');
+    go('compare');
     toast(state.mappingIssues.some(issue => issue.level === 'error') ? 'Review column mapping before validation' : 'Dataset imported; ready to geocode and validate');
   } catch (error) {
     toast(error.message === 'xlsx-library-missing' ? 'XLSX parser is unavailable' : error.message || 'Could not parse this file');
@@ -503,7 +503,7 @@ async function loadCombinedWorkbook(file, workbook) {
   const mappingPanel = $('#column-mapping-panel');
   if (mappingPanel) mappingPanel.dataset.open = 'false';
   renderDataset();
-  go('dataset');
+  go('compare');
 
   const mappingErrors = [
     ...state.mappingIssues.map(issue => `System Import: ${issue.message}`),
@@ -551,7 +551,7 @@ async function loadResourceFile(file) {
     state.latest = null;
     logAllocationDiagnostics(`${extension?.toUpperCase() || 'Dataset'} resource upload: ${file.name}`);
     renderDataset();
-    go('dataset');
+    go('compare');
     await validateAndPrepareResources();
   } catch (error) {
     state.resourceProcessing = false;
@@ -712,6 +712,111 @@ function formatDurationMs(value) {
   return isFiniteNumber(value) ? `${Number(value).toFixed(2)} ms` : 'N/A';
 }
 
+function formatDifferenceValue(value, formatter, digits = 2) {
+  if (!isFiniteNumber(value)) return 'N/A';
+  const numeric = Number(value);
+  if (Math.abs(numeric) < 1e-9) return formatter(0, digits);
+  return `${numeric > 0 ? '+' : ''}${formatter(numeric, digits)}`;
+}
+
+function formatCostDifference(standard, enhanced) {
+  if (!standard || !enhanced) return 'N/A';
+  return 'Different objective units';
+}
+
+function getMatrixSummary(result) {
+  const values = result?.matrixValues || [];
+  if (!values.length) return { min: null, max: null, mean: null, entries: 0 };
+  return {
+    min: Math.min(...values),
+    max: Math.max(...values),
+    mean: values.reduce((sum, value) => sum + value, 0) / values.length,
+    entries: values.length
+  };
+}
+
+function formatMatrixSummary(result, unit = '') {
+  const summary = getMatrixSummary(result);
+  if (!summary.entries) return 'N/A';
+  const suffix = unit ? ` ${unit}` : '';
+  return `min ${round(summary.min, 3)}${suffix}; mean ${round(summary.mean, 3)}${suffix}; max ${round(summary.max, 3)}${suffix}; ${summary.entries} cells`;
+}
+
+function formatCriterionList(items) {
+  return items.map(item => `<span class="criterion-pill">${escapeHtml(item)}</span>`).join('');
+}
+
+function getComparisonState(standard, enhanced, higherIsImproved = true) {
+  if (!isFiniteNumber(standard) || !isFiniteNumber(enhanced)) return 'Comparable';
+  const diff = Number(enhanced) - Number(standard);
+  if (Math.abs(diff) < 1e-9) return 'Comparable';
+  return higherIsImproved ? (diff > 0 ? 'Improved' : 'Lower') : (diff < 0 ? 'Lower' : 'Higher');
+}
+
+function renderMetricSummary(items) {
+  return `<div class="result-summary-grid">${items.map(item => `<div><span>${escapeHtml(item.label)}</span><strong>${item.value}</strong></div>`).join('')}</div>`;
+}
+
+function renderWeightedCostMatrixDetails(result) {
+  if (!result || result.mode !== 'enhanced') return '';
+  const rows = result.activeResources.map((resource, resourceIndex) => {
+    const values = (result.householdOrder || []).map((_, householdIndex) => `<td>${round(result.costMatrix?.[resourceIndex]?.[householdIndex], 3)}</td>`).join('');
+    return `<tr><td>${escapeHtml(resource.resource_id || `R${resourceIndex + 1}`)}</td>${values}</tr>`;
+  }).join('');
+  const householdHeaders = (result.householdOrder || []).map((id, index) => `<th>${escapeHtml(id || `H* ${index + 1}`)}</th>`).join('');
+  return `<details class="technical-details"><summary>View Weighted Cost Matrix</summary><div class="table-wrap matrix-detail-wrap"><table class="compare-table matrix-detail-table"><thead><tr><th>Resource</th>${householdHeaders}</tr></thead><tbody>${rows}</tbody></table></div><p class="compare-note">The full weighted matrix is hidden by default because it is a technical validation artifact, not the primary presentation result.</p></details>`;
+}
+
+function computeComparableWeightedCost(result, rows, activeResources) {
+  if (!result) return null;
+  const enhancedMatrix = buildEnhancedCostMatrix(rows, activeResources).matrix;
+  return (result.output || []).reduce((sum, item) => {
+    const householdIndex = rows.findIndex(row => row === item.household || getHouseholdId(row) === getHouseholdId(item.household));
+    const resourceIndex = item.resourceIndex;
+    const value = enhancedMatrix?.[resourceIndex]?.[householdIndex];
+    return Number.isFinite(Number(value)) ? sum + Number(value) : sum;
+  }, 0);
+}
+
+function simulateDynamicReassignment(enhanced, rows, activeResources) {
+  if (!enhanced || !rows.length) return { status: 'Not Triggered', events: [], affectedCount: 0, durationMs: 0 };
+  const candidate = rows
+    .map((row, index) => ({ row, index, urgency: Number(row.urgency) }))
+    .filter(item => Number.isFinite(item.urgency))
+    .sort((a, b) => b.urgency - a.urgency)[0];
+  if (!candidate) return { status: 'Not Triggered', events: [], affectedCount: 0, durationMs: 0 };
+  const previousUrgency = candidate.urgency;
+  const newUrgency = Math.max(0, Math.min(10, previousUrgency >= 8 ? previousUrgency - 2 : previousUrgency + 2));
+  const delta = Math.abs(newUrgency - previousUrgency);
+  if (delta < 2) {
+    return { status: 'Not Triggered', events: [{ household: candidate.row, previousUrgency, newUrgency, delta, triggered: false }], affectedCount: 0, durationMs: 0 };
+  }
+  const updatedRows = rows.map(row => ({ ...row }));
+  updatedRows[candidate.index].urgency = newUrgency;
+  const previousAssignment = getResultAssignmentForRow(enhanced, candidate.row);
+  const started = performance.now();
+  const updated = runAssignment('enhanced', updatedRows, activeResources);
+  const durationMs = Math.max(.3, performance.now() - started);
+  const updatedAssignment = getResultAssignmentForRow(updated, updatedRows[candidate.index]);
+  return {
+    status: 'Triggered',
+    affectedCount: 1,
+    durationMs,
+    updated,
+    updatedRows,
+    events: [{
+      household: candidate.row,
+      previousUrgency,
+      newUrgency,
+      delta,
+      triggered: true,
+      previousAssignment,
+      updatedAssignment,
+      changed: previousAssignment?.resourceIndex !== updatedAssignment?.resourceIndex
+    }]
+  };
+}
+
 function getResultAssignmentMaps(result) {
   const byRow = new Map();
   const byId = new Map();
@@ -848,9 +953,12 @@ function runAssignment(mode, rows, activeResources) {
     records: rows.length,
     resourceCount: activeResources.length,
     activeResources: activeResources.map(resource => ({ ...resource })),
+    householdOrder: rows.map(row => getHouseholdId(row) || row.household_id || ''),
     matrixRows: activeResources.length,
     matrixColumns: rows.length,
     matrixSize: `${activeResources.length} x ${rows.length}`,
+    matrixValues: matrix.flat().filter(isFiniteNumber).map(Number),
+    costMatrix: matrix.map(row => row.slice()),
     metrics,
     weights: { ...state.weights }
   };
@@ -877,7 +985,7 @@ function execute(mode) {
   const blockers = getRunBlockers(mode);
   if (blockers.length) {
     toast(blockers[0]);
-    go('dataset');
+    go('compare');
     return null;
   }
   const verifiedHouseholds = getVerifiedHouseholdSet();
@@ -932,7 +1040,7 @@ function compare() {
   const blockers = [...getRunBlockers('existing'), ...getRunBlockers('enhanced')];
   if (blockers.length) {
     toast(blockers[0]);
-    go('dataset');
+    go('compare');
     return;
   }
   const existing = execute('existing');
@@ -957,26 +1065,52 @@ renderResult = function (result) {
   const metrics = result.mode === 'existing' ? '#existing-metrics' : '#enhanced-metrics';
   $(target).className = 'result-list';
   const outputRows = result.mode === 'existing'
-    ? result.output.map(item => `<tr><td>${escapeHtml(item.household.household_id)}</td><td>${escapeHtml(item.resource)}</td><td>${formatDistanceKm(item.distanceKm)}</td></tr>`).join('')
-    : result.output.map(item => `<tr><td>${escapeHtml(item.household.household_id)}</td><td>${escapeHtml(item.resource)}</td><td>${formatDistanceKm(item.distanceKm)}</td><td>${escapeHtml(item.household.urgency)}</td><td>${assignmentCompatibilityLabel(item)}</td><td>${round(item.value, 3)}</td></tr>`).join('');
+    ? result.output.map(item => `<tr><td>${escapeHtml(item.resource)}<br><small>${escapeHtml(item.resourceType || '')}</small></td><td>${escapeHtml(item.household.household_id)}</td><td>${formatDistanceKm(item.distanceKm)}</td></tr>`).join('')
+    : result.output.map(item => `<tr><td>${escapeHtml(item.resource)}<br><small>${escapeHtml(item.resourceType || '')}</small></td><td>${escapeHtml(item.household.household_id)}</td><td>${formatDistanceKm(item.distanceKm)}</td><td>${escapeHtml(item.household.urgency)}</td><td>${escapeHtml(formatCompatibilityProfile(item.household))}</td><td>${assignmentCompatibilityLabel(item)}</td><td>${round(item.value, 3)}</td></tr>`).join('');
   const headers = result.mode === 'existing'
-    ? '<tr><th>Household</th><th>Assigned Resource</th><th>Distance</th></tr>'
-    : '<tr><th>Household</th><th>Assigned Resource</th><th>Distance</th><th>Urgency</th><th>Compatibility</th><th>Weighted Cost</th></tr>';
-  $(target).innerHTML = `<div class="table-wrap"><table class="assignment-output-table"><thead>${headers}</thead><tbody>${outputRows}</tbody></table></div>`;
+    ? '<tr><th>Resource ID / Resource Type</th><th>Assigned Household ID</th><th>Distance</th></tr>'
+    : '<tr><th>Resource ID / Resource Type</th><th>Assigned Household ID</th><th>Distance</th><th>Urgency</th><th>Required Resource Type</th><th>Compatibility</th><th>Composite Weighted Cost</th></tr>';
+  const note = result.mode === 'existing'
+    ? 'Baseline output is distance-only. Urgency, vulnerability, compatibility, and research weights are excluded from this tab and from baseline optimization.'
+    : `Fixed research weights: distance ${result.weights.distance.toFixed(3)}, urgency ${result.weights.urgency.toFixed(3)}, compatibility ${result.weights.compatibility.toFixed(3)}.`;
+  const summaryItems = result.mode === 'existing'
+    ? [
+      { label: 'Eligible Households', value: result.records },
+      { label: 'Available Resources', value: result.resourceCount },
+      { label: 'Total Assignments', value: result.metrics.assignmentCount },
+      { label: 'Total Distance', value: formatDistanceKm(result.totalDistance) },
+      { label: 'Mean Distance', value: formatDistanceKm(result.meanDistance) },
+      { label: 'Execution Time', value: formatDurationMs(result.durationMs) }
+    ]
+    : [
+      { label: 'Verified / Eligible Households', value: result.records },
+      { label: 'Total Assignments', value: result.metrics.assignmentCount },
+      { label: 'Allocation Accuracy', value: formatPercent(result.metrics.allocationAccuracy) },
+      { label: 'Prioritization Efficiency', value: formatCoefficient(result.metrics.prioritizationEfficiency) },
+      { label: 'Total Physical Distance', value: formatDistanceKm(result.totalDistance) },
+      { label: 'Total Weighted Cost', value: round(result.cost, 3) },
+      { label: 'Execution Time', value: formatDurationMs(result.durationMs) }
+    ];
+  const tableTitle = result.mode === 'existing' ? 'Standard Hungarian Allocation Results' : 'Enhanced Allocation Results';
+  $(target).innerHTML = `${renderMetricSummary(summaryItems)}<p class="compare-note">${escapeHtml(note)}</p><div class="table-wrap"><table class="assignment-output-table"><caption>${escapeHtml(tableTitle)}</caption><thead>${headers}</thead><tbody>${outputRows}</tbody></table></div>${renderWeightedCostMatrixDetails(result)}`;
   if (result.mode === 'existing') {
-    $(metrics).innerHTML = `<div class="metric-section-title"><span>Optimization criterion</span><strong>Distance only</strong></div><div><span>Total distance cost</span><strong>${formatDistanceKm(result.cost)}</strong></div><div><span>Mean assignment distance</span><strong>${formatDistanceKm(result.meanDistance)}</strong></div><div><span>Maximum assignment distance</span><strong>${formatDistanceKm(result.maxDistance)}</strong></div><div><span>Number of assignments</span><strong>${result.output.length}</strong></div><div><span>Execution time</span><strong>${formatDurationMs(result.durationMs)}</strong></div>`;
+    $(metrics).innerHTML = `<div class="metric-section-title"><span>Displayed basis</span><strong>Distance-only baseline</strong></div><div><span>Cost matrix</span><strong>Geographical distance only</strong></div><div><span>Excluded from baseline</span><strong>Urgency, vulnerability, compatibility, weights</strong></div>`;
   } else {
-    $(metrics).innerHTML = `<div><span>Total weighted cost</span><strong>${round(result.cost, 3)}</strong></div><div><span>Total assignment distance</span><strong>${formatDistanceKm(result.totalDistance)}</strong></div><div><span>Mean allocation accuracy</span><strong>${formatPercent(result.metrics.allocationAccuracy)}</strong></div><div><span>Prioritization efficiency</span><strong>${formatCoefficient(result.metrics.prioritizationEfficiency)}</strong></div><div><span>Execution time</span><strong>${formatDurationMs(result.durationMs)}</strong></div>`;
+    $(metrics).innerHTML = `<div><span>Distance</span><strong>${result.weights.distance.toFixed(3)}</strong></div><div><span>Urgency</span><strong>${result.weights.urgency.toFixed(3)}</strong></div><div><span>Compatibility</span><strong>${result.weights.compatibility.toFixed(3)}</strong></div><div><span>Dynamic re-assignment</span><strong>Shown only when tested</strong></div>`;
   }
   $(`#${result.mode}-status`).textContent = 'Complete';
   $('#stat-latest').textContent = result.mode === 'existing' ? 'Baseline' : 'Enhanced';
   $('#stat-latest-detail').textContent = `${formatDurationMs(result.durationMs)}; ${result.records} verified records`;
-  $('#dashboard-output').className = 'result-list';
-  $('#dashboard-output').innerHTML = result.output.slice(0, 5).map(item => `<div class="result-row"><span>${escapeHtml(item.household.household_id)} <b>&rarr;</b> ${escapeHtml(item.resource)}</span><small>${formatDistanceKm(item.distanceKm)}</small></div>`).join('');
+  const dashboardOutput = $('#dashboard-output');
+  if (dashboardOutput) {
+    dashboardOutput.className = 'result-list';
+    dashboardOutput.innerHTML = result.output.slice(0, 5).map(item => `<div class="result-row"><span>${escapeHtml(item.household.household_id)} <b>&rarr;</b> ${escapeHtml(item.resource)}</span><small>${formatDistanceKm(item.distanceKm)}</small></div>`).join('');
+  }
 };
 
-function renderComparisonTable(rows) {
-  return `<div class="table-wrap compare-table-wrap"><table class="compare-table"><thead><tr><th>Metric</th><th>Standard</th><th>Enhanced</th><th>Difference</th></tr></thead><tbody>${rows.map(row => `<tr><td>${escapeHtml(row.metric)}</td><td>${row.standard}</td><td>${row.enhanced}</td><td>${row.difference}</td></tr>`).join('')}</tbody></table></div>`;
+function renderComparisonTable(rows, title = '') {
+  const caption = title ? `<caption>${escapeHtml(title)}</caption>` : '';
+  return `<div class="table-wrap compare-table-wrap"><table class="compare-table">${caption}<thead><tr><th>Metric</th><th>Existing</th><th>Enhanced</th><th>Difference</th></tr></thead><tbody>${rows.map(row => `<tr><td>${escapeHtml(row.metric)}</td><td>${row.standard}</td><td>${row.enhanced}</td><td>${row.difference}</td></tr>`).join('')}</tbody></table></div>`;
 }
 
 function compareHigherBetter(standard, enhanced) {
@@ -1036,7 +1170,7 @@ function assignmentLabel(item) {
 
 function assignmentCompatibilityLabel(item) {
   if (!item) return 'Unassigned';
-  return isAssignedCompatible(item) ? 'Match' : 'Mismatch';
+  return isAssignedCompatible(item) ? 'Yes' : 'No';
 }
 
 function buildHouseholdComparisonRows(rows, existing, enhanced) {
@@ -1062,9 +1196,9 @@ function buildHouseholdComparisonRows(rows, existing, enhanced) {
 }
 
 function renderHouseholdComparisonTable(rows) {
-  return `<div class="table-wrap household-compare-wrap"><table class="compare-table household-compare-table" id="household-change-table"><thead><tr><th>Household</th><th>Urgency</th><th>Resource Need</th><th>Standard Assignment</th><th>Standard Distance</th><th>Standard Compatibility</th><th>Enhanced Assignment</th><th>Enhanced Distance</th><th>Enhanced Compatibility</th><th>Changed?</th></tr></thead><tbody>${rows.map(row => {
+  return `<p class="compare-note">Urgency and resource need are shown here only to explain the Enhanced output and to evaluate both completed assignments. The Existing assignment columns remain distance-only.</p><div class="table-wrap household-compare-wrap"><table class="compare-table household-compare-table" id="household-change-table"><thead><tr><th>Household</th><th>Urgency</th><th>Resource Need</th><th>Existing Assignment</th><th>Existing Distance</th><th>Enhanced Assignment</th><th>Enhanced Distance</th><th>Enhanced Compatibility</th><th>Changed?</th></tr></thead><tbody>${rows.map(row => {
     const attrs = row.changed ? ` data-change-index="${row.index}" tabindex="0"` : '';
-    return `<tr class="household-change-row${row.changed ? ' is-changed' : ''}"${attrs}><td>${escapeHtml(getHouseholdId(row.household) || row.household.household_id || `H* ${row.index + 1}`)}</td><td>${escapeHtml(row.household.urgency)}</td><td>${escapeHtml(formatCompatibilityProfile(row.household))}</td><td>${escapeHtml(assignmentLabel(row.standard))}</td><td>${formatDistanceKm(row.standard?.distanceKm)}</td><td>${assignmentCompatibilityLabel(row.standard)}</td><td>${escapeHtml(assignmentLabel(row.enhanced))}</td><td>${formatDistanceKm(row.enhanced?.distanceKm)}</td><td>${assignmentCompatibilityLabel(row.enhanced)}</td><td>${escapeHtml(row.label)}</td></tr>`;
+    return `<tr class="household-change-row${row.changed ? ' is-changed' : ''}"${attrs}><td>${escapeHtml(getHouseholdId(row.household) || row.household.household_id || `H* ${row.index + 1}`)}</td><td>${escapeHtml(row.household.urgency)}</td><td>${escapeHtml(formatCompatibilityProfile(row.household))}</td><td>${escapeHtml(assignmentLabel(row.standard))}</td><td>${formatDistanceKm(row.standard?.distanceKm)}</td><td>${escapeHtml(assignmentLabel(row.enhanced))}</td><td>${formatDistanceKm(row.enhanced?.distanceKm)}</td><td>${assignmentCompatibilityLabel(row.enhanced)}</td><td>${escapeHtml(row.label)}</td></tr>`;
   }).join('')}</tbody></table></div>`;
 }
 
@@ -1114,7 +1248,7 @@ function buildBenchmarkRows(rows) {
 
 function renderBenchmarkTable(rows) {
   const benchmarks = buildBenchmarkRows(rows);
-  return `<div class="table-wrap benchmark-wrap"><table class="compare-table benchmark-table"><thead><tr><th>Matrix Size</th><th>Status</th><th>Standard Time</th><th>Enhanced Time</th><th>Standard Accuracy</th><th>Enhanced Accuracy</th><th>Standard Urgency-Compat r</th><th>Enhanced Urgency-Compat r</th><th>Standard Cost</th><th>Enhanced Cost</th><th>Standard Distance</th><th>Enhanced Distance</th></tr></thead><tbody>${benchmarks.map(row => `<tr><td>${row.size}x${row.size}</td><td>${escapeHtml(row.status)}</td><td>${formatDurationMs(row.standard?.durationMs)}</td><td>${formatDurationMs(row.enhanced?.durationMs)}</td><td>${formatPercent(row.standard?.metrics.allocationAccuracy)}</td><td>${formatPercent(row.enhanced?.metrics.allocationAccuracy)}</td><td>${formatCoefficient(row.standard?.metrics.prioritizationEfficiency)}</td><td>${formatCoefficient(row.enhanced?.metrics.prioritizationEfficiency)}</td><td>${row.standard ? formatDistanceKm(row.standard.cost) : 'N/A'}</td><td>${row.enhanced ? round(row.enhanced.cost, 3) : 'N/A'}</td><td>${formatDistanceKm(row.standard?.totalDistance)}</td><td>${formatDistanceKm(row.enhanced?.totalDistance)}</td></tr>`).join('')}</tbody></table></div>`;
+  return `<div class="table-wrap benchmark-wrap"><table class="compare-table benchmark-table"><caption>SOP 3 - Computational Performance</caption><thead><tr><th>Matrix Size</th><th>Existing Time</th><th>Enhanced Time</th><th>Difference</th></tr></thead><tbody>${benchmarks.map(row => `<tr><td>${row.size}x${row.size}</td><td>${row.standard ? formatDurationMs(row.standard.durationMs) : escapeHtml(row.status)}</td><td>${row.enhanced ? formatDurationMs(row.enhanced.durationMs) : escapeHtml(row.status)}</td><td>${row.standard && row.enhanced ? formatSignedNumber(row.enhanced.durationMs - row.standard.durationMs, 2, ' ms') : 'Not tested'}</td></tr>`).join('')}</tbody></table></div>`;
 }
 
 function renderTradeoffSummary(existing, enhanced) {
@@ -1164,15 +1298,45 @@ function renderInterpretations(existing, enhanced, changedCount, rows) {
 function renderComparisonReport(existing, enhanced, rows, activeResources) {
   const householdRows = buildHouseholdComparisonRows(rows, existing, enhanced);
   const changedCount = householdRows.filter(row => row.changed).length;
+  const dynamic = simulateDynamicReassignment(enhanced, rows, activeResources);
+  const highUrgencyExistingRate = getHighUrgencyServiceRate(existing);
+  const highUrgencyEnhancedRate = getHighUrgencyServiceRate(enhanced);
+  const existingComparableCost = computeComparableWeightedCost(existing, rows, activeResources);
+  const enhancedComparableCost = computeComparableWeightedCost(enhanced, rows, activeResources);
+  const existingDynamicRecalc = dynamic.updatedRows ? runAssignment('existing', dynamic.updatedRows, activeResources) : null;
   const metricRows = [
-    { metric: 'Total Assignment Cost', standard: formatDistanceKm(existing.cost), enhanced: round(enhanced.cost, 3), difference: 'Different units' },
-    { metric: 'Mean Allocation Accuracy', standard: formatPercent(existing.metrics.allocationAccuracy), enhanced: formatPercent(enhanced.metrics.allocationAccuracy), difference: formatPercentagePoint(enhanced.metrics.allocationAccuracy - existing.metrics.allocationAccuracy) },
-    { metric: 'Prioritization Efficiency', standard: formatCoefficient(existing.metrics.prioritizationEfficiency), enhanced: formatCoefficient(enhanced.metrics.prioritizationEfficiency), difference: formatCoefficientChange(existing.metrics.prioritizationEfficiency, enhanced.metrics.prioritizationEfficiency) },
-    { metric: 'Execution Time', standard: formatDurationMs(existing.durationMs), enhanced: formatDurationMs(enhanced.durationMs), difference: formatSignedNumber(enhanced.durationMs - existing.durationMs, 2, ' ms') }
+    { metric: 'Optimization criteria', standard: 'Distance only', enhanced: 'Distance + Urgency + Compatibility', difference: 'Enhanced includes 3 criteria' },
+    { metric: 'Total physical distance', standard: formatDistanceKm(existing.metrics.totalDistance), enhanced: formatDistanceKm(enhanced.metrics.totalDistance), difference: formatSignedNumber(enhanced.metrics.totalDistance - existing.metrics.totalDistance, 2, ' km') },
+    { metric: 'Mean physical distance', standard: formatDistanceKm(existing.metrics.meanDistance), enhanced: formatDistanceKm(enhanced.metrics.meanDistance), difference: formatSignedNumber(enhanced.metrics.meanDistance - existing.metrics.meanDistance, 2, ' km') },
+    { metric: 'Compatible assignments', standard: `${existing.metrics.compatibleAssignments} / ${existing.metrics.assignmentCount}`, enhanced: `${enhanced.metrics.compatibleAssignments} / ${enhanced.metrics.assignmentCount}`, difference: formatSignedInteger(enhanced.metrics.compatibleAssignments - existing.metrics.compatibleAssignments) },
+    { metric: 'Mean allocation accuracy', standard: formatPercent(existing.metrics.allocationAccuracy), enhanced: formatPercent(enhanced.metrics.allocationAccuracy), difference: formatPercentagePoint(enhanced.metrics.allocationAccuracy - existing.metrics.allocationAccuracy) },
+    { metric: 'High-urgency households served', standard: formatHighUrgencyServed(existing), enhanced: formatHighUrgencyServed(enhanced), difference: isFiniteNumber(highUrgencyExistingRate) && isFiniteNumber(highUrgencyEnhancedRate) ? formatPercentagePoint(highUrgencyEnhancedRate - highUrgencyExistingRate) : 'Requires high-urgency H*' },
+    { metric: 'Prioritization efficiency', standard: formatCoefficient(existing.metrics.prioritizationEfficiency), enhanced: formatCoefficient(enhanced.metrics.prioritizationEfficiency), difference: formatCoefficientChange(existing.metrics.prioritizationEfficiency, enhanced.metrics.prioritizationEfficiency) },
+    { metric: 'Shared / comparable weighted cost', standard: round(existingComparableCost, 3), enhanced: round(enhancedComparableCost, 3), difference: formatSignedNumber(enhancedComparableCost - existingComparableCost, 3) },
+    { metric: 'Execution time', standard: formatDurationMs(existing.durationMs), enhanced: formatDurationMs(enhanced.durationMs), difference: formatSignedNumber(enhanced.durationMs - existing.durationMs, 2, ' ms') },
+    { metric: 'Dynamic re-assignment capability', standard: 'Not supported', enhanced: dynamic.status, difference: dynamic.status }
   ];
-  const resourceDetails = activeResources.map(resource => `<tr><td>${escapeHtml(resource.resource_id)}</td><td>${escapeHtml(resource.resource_type)}</td><td>${formatDistanceKm(geoDistanceKm(RELIEF_HUB.coordinates, [Number(resource.latitude), Number(resource.longitude)]))}</td><td>${escapeHtml(resource.coordinate_precision || '')}</td></tr>`).join('');
-  const technicalDetails = `<details class="technical-details"><summary>Technical Details</summary><div class="table-wrap"><table class="compare-table"><thead><tr><th>Resource ID</th><th>Type</th><th>Distance From Hub</th><th>Coordinate Precision</th></tr></thead><tbody>${resourceDetails}</tbody></table></div><p class="compare-note">Matrix: ${escapeHtml(existing.matrixSize)}. Assignments changed: ${changedCount}. Standard assignments: ${existing.metrics.assignmentCount}. Enhanced assignments: ${enhanced.metrics.assignmentCount}. Enhanced AHP weights: distance ${state.weights.distance.toFixed(3)}, urgency ${state.weights.urgency.toFixed(3)}, compatibility ${state.weights.compatibility.toFixed(3)}.</p></details>`;
-  $('#compare-content').innerHTML = `<section class="panel compare-section"><div class="panel-head"><div><p class="eyebrow">Experiment summary</p><h3>Shared controlled inputs</h3></div></div><div class="compare-summary-grid"><div><span>Dataset</span><strong>${escapeHtml(state.filename || 'Uploaded dataset')}</strong></div><div><span>Resource dataset</span><strong>${escapeHtml(state.resourceFilename || 'Uploaded resources')}</strong></div><div><span>Verified H* count</span><strong>${rows.length}</strong></div><div><span>Resource count</span><strong>${activeResources.length}</strong></div><div><span>Matrix size</span><strong>${existing.matrixSize}</strong></div><div><span>Assignments changed</span><strong>${changedCount}</strong></div><div><span>Standard objective</span><strong>Distance Only</strong></div><div><span>Enhanced objective</span><strong>Distance + Urgency + Compatibility</strong></div><div><span>Shared coordinates</span><strong>${rows.filter(hasValidCoordinates).length} H* records</strong></div></div></section><section class="panel compare-section"><div class="panel-head"><div><p class="eyebrow">Computed metrics</p><h3>Standard vs Enhanced</h3></div></div>${renderComparisonTable(metricRows)}<p class="compare-note">Native objective costs use each algorithm's own units. All other rows are computed from the current uploaded dataset and actual assignment outputs.</p></section><section class="panel compare-section"><div class="panel-head"><div><p class="eyebrow">Assignments</p><h3>Household-level comparison</h3></div></div>${renderHouseholdComparisonTable(householdRows)}</section>${technicalDetails}`;
+  const sop1Rows = [
+    { metric: 'Criteria Used', standard: formatCriterionList(['Distance']), enhanced: formatCriterionList(['Distance', 'Urgency', 'Compatibility']), difference: 'Implemented' },
+    { metric: 'Compatible assignments', standard: `${existing.metrics.compatibleAssignments} / ${existing.metrics.assignmentCount}`, enhanced: `${enhanced.metrics.compatibleAssignments} / ${enhanced.metrics.assignmentCount}`, difference: formatSignedInteger(enhanced.metrics.compatibleAssignments - existing.metrics.compatibleAssignments) },
+    { metric: 'Allocation accuracy', standard: formatPercent(existing.metrics.allocationAccuracy), enhanced: formatPercent(enhanced.metrics.allocationAccuracy), difference: formatPercentagePoint(enhanced.metrics.allocationAccuracy - existing.metrics.allocationAccuracy) },
+    { metric: 'High-urgency households served', standard: formatHighUrgencyServed(existing), enhanced: formatHighUrgencyServed(enhanced), difference: isFiniteNumber(highUrgencyExistingRate) && isFiniteNumber(highUrgencyEnhancedRate) ? formatPercentagePoint(highUrgencyEnhancedRate - highUrgencyExistingRate) : 'Requires high-urgency H*' },
+    { metric: 'Prioritization efficiency', standard: formatCoefficient(existing.metrics.prioritizationEfficiency), enhanced: formatCoefficient(enhanced.metrics.prioritizationEfficiency), difference: formatCoefficientChange(existing.metrics.prioritizationEfficiency, enhanced.metrics.prioritizationEfficiency) },
+    { metric: 'Total physical distance', standard: formatDistanceKm(existing.metrics.totalDistance), enhanced: formatDistanceKm(enhanced.metrics.totalDistance), difference: formatSignedNumber(enhanced.metrics.totalDistance - existing.metrics.totalDistance, 2, ' km') },
+    { metric: 'Comparable weighted objective', standard: round(existingComparableCost, 3), enhanced: round(enhancedComparableCost, 3), difference: formatSignedNumber(enhancedComparableCost - existingComparableCost, 3) }
+  ];
+  const changedByDynamic = dynamic.events.some(event => event.changed);
+  const dynamicRows = dynamic.events.length ? `<tr><td>Urgency change test</td><td>${dynamic.affectedCount}</td><td>${dynamic.status === 'Triggered' ? 'Yes' : 'No'}</td><td>Full baseline recalculation required</td><td>${dynamic.status === 'Triggered' ? 'Affected urgency value updated; enhanced output re-optimized' : 'No recomputation'}</td><td>${formatDurationMs(existingDynamicRecalc?.durationMs)}</td><td>${formatDurationMs(dynamic.durationMs)}</td><td>${changedByDynamic ? 'Yes' : 'No'}</td></tr>` : '';
+  const dynamicDetailRows = dynamic.events.map(event => `<tr><td>${escapeHtml(getHouseholdId(event.household) || event.household.household_id || 'H*')}</td><td>${round(event.previousUrgency, 1)}</td><td>${round(event.newUrgency, 1)}</td><td>${round(event.delta, 1)}</td><td>${escapeHtml(assignmentLabel(event.previousAssignment))}</td><td>${escapeHtml(assignmentLabel(event.updatedAssignment))}</td><td>${event.changed ? 'Yes' : 'No'}</td></tr>`).join('');
+  const sop2Table = dynamicRows ? `<div class="table-wrap compare-table-wrap"><table class="compare-table"><caption>SOP 2 - Dynamic Re-Assignment Evaluation</caption><thead><tr><th>Event</th><th>Affected Households</th><th>Triggered by Delta &gt;= 2?</th><th>Existing Recalculation Scope</th><th>Enhanced Recalculation Scope</th><th>Existing Time</th><th>Enhanced Time</th><th>Assignment Changed?</th></tr></thead><tbody>${dynamicRows}</tbody></table></div><details class="technical-details"><summary>View Dynamic Event Details</summary><div class="table-wrap compare-table-wrap"><table class="compare-table"><thead><tr><th>Household ID</th><th>Previous Urgency</th><th>New Urgency</th><th>Delta</th><th>Previous Assignment</th><th>Updated Assignment</th><th>Changed?</th></tr></thead><tbody>${dynamicDetailRows}</tbody></table></div></details>` : '';
+  const objectiveRows = [
+    { metric: 'SOP 1 / Multi-Criteria Allocation', standard: 'Distance only', enhanced: 'Implemented', difference: getComparisonState(existing.metrics.allocationAccuracy, enhanced.metrics.allocationAccuracy, true) },
+    { metric: 'SOP 2 / Adaptive Assignment', standard: 'Static assignment', enhanced: dynamic.status, difference: dynamic.events[0]?.changed ? 'Changed' : dynamic.status },
+    { metric: 'SOP 3 / Computational Evaluation', standard: formatDurationMs(existing.durationMs), enhanced: formatDurationMs(enhanced.durationMs), difference: compareFasterInThisRun(existing.durationMs, enhanced.durationMs) }
+  ];
+  const assignmentDetails = `<details class="technical-details"><summary>View Household-Level Assignment Comparison</summary>${renderHouseholdComparisonTable(householdRows)}</details>`;
+  const technicalDetails = `<details class="technical-details"><summary>View Technical Details</summary><p class="compare-note">Existing distance-only matrix summary: ${escapeHtml(formatMatrixSummary(existing, 'km'))}. Enhanced matrix summary: ${escapeHtml(formatMatrixSummary(enhanced))}. Enhanced weights: distance ${state.weights.distance.toFixed(3)}, urgency ${state.weights.urgency.toFixed(3)}, compatibility ${state.weights.compatibility.toFixed(3)}.</p></details>`;
+  $('#compare-content').innerHTML = `<section class="panel compare-section"><div class="panel-head"><div><p class="eyebrow">Main comparison</p><h3>Existing vs Enhanced Algorithm Comparison</h3></div></div>${renderComparisonTable(metricRows, 'Existing vs Enhanced Algorithm Comparison')}<p class="compare-note">Baseline urgency and compatibility values are post-run evaluation only; they do not enter the Existing Algorithm cost matrix. The shared weighted cost row applies the enhanced Distance + Urgency + Compatibility objective to both assignment outputs for comparison. The Enhanced Algorithm does not have to produce the shortest physical distance because urgency and compatibility have higher research weights.</p></section><section class="panel compare-section"><div class="panel-head"><div><p class="eyebrow">Experimental fairness</p><h3>Shared controlled inputs</h3></div></div><div class="compare-summary-grid"><div><span>Raw household rows</span><strong>${state.dataset.length}</strong></div><div><span>Verified H*</span><strong>${rows.length}</strong></div><div><span>Resource set R</span><strong>${activeResources.length}</strong></div><div><span>Matrix dimensions</span><strong>${existing.matrixSize}</strong></div><div><span>Existing branch</span><strong>H* to distance-only matrix</strong></div><div><span>Enhanced branch</span><strong>H* to weighted matrix</strong></div><div><span>Assignments changed</span><strong>${changedCount}</strong></div><div><span>Shared coordinates</span><strong>${rows.filter(hasValidCoordinates).length} H* records</strong></div></div></section><section class="panel compare-section"><div class="panel-head"><div><p class="eyebrow">SOP 1</p><h3>Multi-Criteria Allocation Comparison</h3></div></div>${renderComparisonTable(sop1Rows, 'SOP 1 - Multi-Criteria Allocation Comparison')}</section>${sop2Table ? `<section class="panel compare-section"><div class="panel-head"><div><p class="eyebrow">SOP 2</p><h3>Dynamic Re-Assignment Evaluation</h3></div></div>${sop2Table}</section>` : ''}<section class="panel compare-section"><div class="panel-head"><div><p class="eyebrow">SOP 3</p><h3>Computational Performance</h3></div></div>${renderBenchmarkTable(rows)}<p class="compare-note">Both versions use the Hungarian solver, so this interface reports measured execution performance objectively and does not claim a lower theoretical complexity.</p></section><section class="panel compare-section"><div class="panel-head"><div><p class="eyebrow">Research objective evaluation</p><h3>Measured states</h3></div></div>${renderComparisonTable(objectiveRows)}</section>${assignmentDetails}${technicalDetails}`;
   bindComparisonReport(householdRows);
 }
 
@@ -1182,7 +1346,7 @@ compare = function () {
   const blockers = [...getRunBlockers('existing', selectedSize), ...getRunBlockers('enhanced', selectedSize)];
   if (blockers.length) {
     toast(blockers[0]);
-    go('dataset');
+      go('compare');
     return null;
   }
   const { households: verifiedHouseholds, resources: activeResources } = getControlledComparisonInputs(selectedSize);
@@ -1195,7 +1359,7 @@ compare = function () {
   return { existing, enhanced };
 };
 
-function bind() { document.querySelectorAll('[data-page]').forEach(item => item.addEventListener('click', event => { event.preventDefault(); go(item.dataset.page); })); document.querySelectorAll('[data-page-target]').forEach(item => item.addEventListener('click', () => go(item.dataset.pageTarget))); document.querySelectorAll('[data-run]').forEach(item => item.addEventListener('click', () => { try { if (item.dataset.run === 'both') { if (compare()) go('compare'); } else { if (execute(item.dataset.run)) go(item.dataset.run); } } catch (error) { reportRunError(error); } })); $('#file-input').addEventListener('change', event => loadFile(event.target.files[0])); $('#resource-file-input')?.addEventListener('change', event => loadResourceFile(event.target.files[0])); $('#comparison-size')?.addEventListener('change', event => { state.comparisonSize = Number(event.target.value); renderDataset(); }); $('#table-search').addEventListener('input', renderTable); $('#clear-history').addEventListener('click', () => { state.history = []; localStorage.removeItem('allocation-history'); renderHistory(); toast('History cleared'); }); }
+function bind() { document.querySelectorAll('[data-page]').forEach(item => item.addEventListener('click', event => { event.preventDefault(); go(item.dataset.page); })); document.querySelectorAll('[data-page-target]').forEach(item => item.addEventListener('click', () => go(item.dataset.pageTarget))); document.querySelectorAll('[data-run]').forEach(item => item.addEventListener('click', () => { try { if (item.dataset.run === 'both') { if (compare()) go('compare'); } else { if (execute(item.dataset.run)) go(item.dataset.run); } } catch (error) { reportRunError(error); } })); $('#file-input')?.addEventListener('change', event => loadFile(event.target.files[0])); $('#resource-file-input')?.addEventListener('change', event => loadResourceFile(event.target.files[0])); $('#comparison-size')?.addEventListener('change', event => { state.comparisonSize = Number(event.target.value); renderDataset(); }); $('#table-search')?.addEventListener('input', renderTable); $('#clear-history')?.addEventListener('click', () => { state.history = []; localStorage.removeItem('allocation-history'); renderHistory(); toast('History cleared'); }); }
 function initializeApp() {
   bind();
   if ($('#comparison-size')) $('#comparison-size').value = String(state.comparisonSize);
@@ -1211,10 +1375,12 @@ function initializeApp() {
     $(`#enh-${name}-label`).textContent = state.weights[key].toFixed(3);
   });
   $('.threshold span').textContent = 'Fixed re-assignment threshold';
+  $('.threshold strong').textContent = 'Delta >= 2';
   $('.threshold strong').textContent = 'Δ ≥ 2';
-  $('#settings-hub-address').textContent = RELIEF_HUB.address;
-  $('#settings-geocoding-context').textContent = RESEARCH_CONFIG.geocodingContext;
-  go(location.hash.slice(1) || 'dashboard');
+  $('.threshold strong').textContent = 'Delta >= 2';
+  if ($('#settings-hub-address')) $('#settings-hub-address').textContent = RELIEF_HUB.address;
+  if ($('#settings-geocoding-context')) $('#settings-geocoding-context').textContent = RESEARCH_CONFIG.geocodingContext;
+  go(location.hash.slice(1) || 'existing');
 }
 
 function renderReliefMap() {
@@ -1225,7 +1391,9 @@ function renderReliefMap() {
     panel.id = 'relief-map-panel';
     panel.className = 'panel map-panel';
     panel.innerHTML = `<div class="panel-head"><div><p class="eyebrow">Research area</p><h3>${RELIEF_HUB.name} household locations</h3></div><div class="map-legend" aria-label="Household urgency legend">${MAP_LEGEND}</div></div><div id="relief-map" class="relief-map"></div><div class="map-foot"><span>Resolved household locations and the configured research boundary are shown.</span><strong id="map-count">0 households mapped</strong></div>`;
-    $('#view-dashboard').appendChild(panel);
+    const mapHost = $('#view-compare');
+    if (!mapHost) return;
+    mapHost.appendChild(panel);
   }
   if (!window.reliefMap) {
     window.reliefMap = createReliefMap('relief-map');
@@ -1253,8 +1421,7 @@ function renderReliefMap() {
 }
 
 const renderDatasetWithMap = renderDataset;
-renderDataset = function () { renderDatasetWithMap(); renderReliefMap(); };
-setTimeout(renderReliefMap, 0);
+renderDataset = function () { renderDatasetWithMap(); };
 
 function geoDistanceKm(from, to) {
   const radians = value => value * Math.PI / 180;
@@ -2091,7 +2258,7 @@ async function validateAndPrepareDataset({ autoRun = false } = {}) {
       toast(`${state.validation.eligibleHouseholds} verified households validated and compared`);
     }
   } else {
-    go('dataset');
+    go('compare');
     toast(`Geocoding complete: ${state.validation.addressesResolved} resolved, ${state.validation.addressesUnresolved} unresolved, ${state.validation.eligibleHouseholds} H*`);
   }
 }
@@ -2611,13 +2778,9 @@ function getHouseholdCardContext(item) {
 }
 
 function buildExistingHouseholdInfoHtml(item, hubDistance) {
-  const { row, usedFields, idField, headField, membersField, urgencyField, verificationField, verificationReasonField, sourceVerificationField, compatibleField, assignmentStatus, allocation, outsideRunScope } = getHouseholdCardContext(item);
+  const { row, usedFields, idField, verificationField, assignmentStatus, allocation, outsideRunScope } = getHouseholdCardContext(item);
   const householdId = idField?.value || 'Household';
-  const urgencyMeta = urgencyField ? getUrgencyMeta(urgencyField.value) : null;
   const algorithmDetails = [];
-  const datasetDetails = [];
-  const lat = Number(row.latitude);
-  const lon = Number(row.longitude);
   const basis = outsideRunScope ? assignmentStatus : item.assigned ? 'Minimum Distance' : isPending(row) ? 'Verification required before optimization' : 'No resource assigned';
 
   addHouseholdDetail(algorithmDetails, usedFields, 'Assigned resource', allocation);
@@ -2627,18 +2790,10 @@ function buildExistingHouseholdInfoHtml(item, hubDistance) {
   addHouseholdDetail(algorithmDetails, usedFields, 'H* status', verificationField);
   addHouseholdDetail(algorithmDetails, usedFields, 'Assignment status', assignmentStatus);
 
-  addHouseholdDetail(datasetDetails, usedFields, 'Verification reason', verificationReasonField);
-  addHouseholdDetail(datasetDetails, usedFields, 'Representative', headField);
-  addHouseholdDetail(datasetDetails, usedFields, 'Address', getAddressField(row, usedFields));
-  addHouseholdDetail(datasetDetails, usedFields, 'Members', membersField);
-  addHouseholdDetail(datasetDetails, usedFields, 'Geocoding status', row.geocoding_status);
-  addHouseholdDetail(datasetDetails, usedFields, 'Research area', row.location_status);
-  if (hasValidCoordinates(row)) addHouseholdDetail(datasetDetails, usedFields, 'Coordinates', `${lat.toFixed(5)}, ${lon.toFixed(5)}`);
-
   const stateBadge = `<span class="household-state-badge">${escapeHtml(assignmentStatus)}</span>`;
-  const datasetNote = 'Existing Hungarian output is based only on distance. Urgency and compatibility are not used in this decision.';
+  const datasetNote = 'Existing Hungarian output is based only on distance.';
 
-  return `<div class="household-card-kicker">Existing algorithm assignment</div><div class="household-card-title"><strong>${escapeHtml(householdId)}</strong>${stateBadge}</div>${renderHouseholdSection('Distance-only decision', algorithmDetails)}${renderHouseholdSection('Dataset information', datasetDetails, datasetNote)}`;
+  return `<div class="household-card-kicker">Existing algorithm assignment</div><div class="household-card-title"><strong>${escapeHtml(householdId)}</strong>${stateBadge}</div>${renderHouseholdSection('Distance-only decision', algorithmDetails, datasetNote)}`;
 }
 
 function buildEnhancedHouseholdInfoHtml(item, hubDistance) {
@@ -2949,6 +3104,22 @@ function renderAssignmentMap(result) {
     panel.innerHTML = `<div class="panel-head"><div><p class="eyebrow">Allocation view · Barangay 160</p><h3>${getAlgorithmMapTitle(target)} household assignments</h3></div><div class="map-head-actions"><div class="map-legend" aria-label="${target === 'existing' ? 'Distance-only assignment legend' : 'Household urgency legend'}">${getAssignmentMapLegend(target)}</div><button class="small-button map-expand-button" type="button" data-map-toggle="${target}" aria-expanded="false" aria-controls="${target}-assignment-map">Full Map</button></div></div><div id="${target}-assignment-map" class="relief-map"></div><div class="map-foot"><span>Lines visualize assignments only; they are not delivery routes.</span><strong id="${target}-assignment-map-count">0 assignments</strong></div></div>`;
     view.appendChild(panel);
   }
+  if (!panel.querySelector('.map-details')) {
+    const details = document.createElement('details');
+    details.className = 'map-details';
+    const summary = document.createElement('summary');
+    summary.textContent = 'View Assignment Map';
+    details.appendChild(summary);
+    while (panel.firstChild) details.appendChild(panel.firstChild);
+    panel.appendChild(details);
+  }
+  const details = panel.querySelector('.map-details');
+  if (details && !details.dataset.bound) {
+    details.dataset.bound = 'true';
+    details.addEventListener('toggle', () => {
+      if (details.open) setTimeout(() => refreshAssignmentMapSize(target), 0);
+    });
+  }
   bindAssignmentMapPanelControls(target);
   if (!window.assignmentMaps) window.assignmentMaps = {};
   if (!window.assignmentMaps[target]) {
@@ -3048,6 +3219,22 @@ function renderComparisonMaps() {
     panel.className = 'panel comparison-map-panel';
     panel.innerHTML = `<div class="panel-head"><div><p class="eyebrow">Geographic comparison</p><h3>Standard distance baseline vs enhanced weighted model</h3></div></div><div class="comparison-map-grid"><div><div class="comparison-map-head"><h4>Standard Hungarian · distance only</h4><div class="map-legend" aria-label="Standard distance-only legend">${EXISTING_MAP_LEGEND}</div></div><div id="compare-existing-map" class="relief-map"></div></div><div><div class="comparison-map-head"><h4>Enhanced Hungarian · distance + urgency + compatibility</h4><div class="map-legend" aria-label="Enhanced priority legend">${MAP_LEGEND}</div></div><div id="compare-enhanced-map" class="relief-map"></div></div></div><div class="map-foot"><span>Click a household marker to inspect its assignment. Lines start from the Barangay hub; they are not routes.</span><strong>Same Barangay 160 research area</strong></div>`;
     $('#view-compare').appendChild(panel);
+  }
+  if (!panel.querySelector('.map-details')) {
+    const details = document.createElement('details');
+    details.className = 'map-details';
+    const summary = document.createElement('summary');
+    summary.textContent = 'View Geographic Comparison Map';
+    details.appendChild(summary);
+    while (panel.firstChild) details.appendChild(panel.firstChild);
+    panel.appendChild(details);
+  }
+  const details = panel.querySelector('.map-details');
+  if (details && !details.dataset.bound) {
+    details.dataset.bound = 'true';
+    details.addEventListener('toggle', () => {
+      if (details.open) setTimeout(refreshVisibleComparisonMaps, 0);
+    });
   }
   ['existing', 'enhanced'].forEach(target => renderComparisonMap(state.results[target] || null, target));
 }
