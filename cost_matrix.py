@@ -1,6 +1,7 @@
 """Multi-Objective Weighted Cost Matrix (Module 2)
 
-Solves SOP 1 / Objective 1: construct C[i][j] = w1*Distance + w2*Urgency + w3*Compatibility
+Solves SOP 1 / Objective 1: construct a composite weighted cost using
+distance, urgency, and resource compatibility.
 Default weights are AHP-derived from thesis: w1=0.164, w2=0.539, w3=0.297
 Includes a small AHP utility for traceability.
 """
@@ -107,12 +108,12 @@ def build_cost_matrix(households: pd.DataFrame, resources: pd.DataFrame, distanc
     # normalize components to 0..1
     dist_n = normalize_array(np.array(distance_matrix, dtype=float))
     urg_n = normalize_array(urgencies)
-    # expand urgencies to matrix rows
-    # Hungarian minimizes cost, so a more urgent household must have a lower
-    # urgency-cost value. This implements "maximize urgency prioritization".
-    urg_mat = np.repeat((1.0 - urg_n).reshape((n, 1)), n, axis=1)
+    # Urgency must affect a resource choice, not only add a constant to each
+    # household row. High-urgency households therefore receive a larger penalty
+    # when paired with a less compatible resource.
+    urg_mat = urg_n.reshape((n, 1)) * (1.0 - comp)
     comp_n = comp  # compatibility already 0..1
 
     C = w1 * dist_n + w2 * urg_mat + w3 * (1.0 - comp_n)
-    # Note: higher compatibility reduces cost (1 - comp)
+    # Note: higher compatibility reduces cost, especially for urgent households.
     return C
