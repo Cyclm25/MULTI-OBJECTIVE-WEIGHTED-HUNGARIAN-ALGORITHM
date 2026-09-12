@@ -9,6 +9,9 @@ const RESOURCE_TYPE_COMPATIBILITY_COLUMNS = Object.freeze({
 });
 const RESEARCH_WEIGHTS = Object.freeze({ distance: 0.164, urgency: 0.539, compatibility: 0.297 });
 const BENCHMARK_MATRIX_SIZES = Object.freeze([10, 20, 30, 40, 50, 60]);
+const BENCHMARK_WARMUP_RUNS = 3;
+const BENCHMARK_REPETITIONS = 30;
+const SELECTIVE_REASSIGNMENT_CANDIDATE_RESOURCES = 4;
 const HIGH_URGENCY_THRESHOLD = 7;
 const FOUR_POINT_HIGH_URGENCY_THRESHOLD = 3;
 const HUNDRED_POINT_HIGH_URGENCY_THRESHOLD = 70;
@@ -41,7 +44,7 @@ const RESEARCH_CONFIG = {
     requestDelayMs: 1100
   }
 };
-const state = { rawRows: [], rawHeaders: [], columnMapping: {}, mappingIssues: [], dataset: [], researchDataset: [], verifiedHouseholdSet: [], invalidRows: [], validation: null, filename: '', resourceRows: [], resourceHeaders: [], resourceMapping: {}, resourceMappingIssues: [], reliefResources: [], resourceValidation: null, resourceFilename: '', resourceSource: '', comparisonSize: 10, currentResources: [], latest: null, results: {}, history: JSON.parse(localStorage.getItem('allocation-history') || '[]'), weights: deriveAHPWeights(), geocodeCache: JSON.parse(localStorage.getItem(GEOCODE_CACHE_KEY) || '{}'), processing: false, resourceProcessing: false };
+const state = { rawRows: [], rawHeaders: [], columnMapping: {}, mappingIssues: [], dataset: [], researchDataset: [], verifiedHouseholdSet: [], invalidRows: [], validation: null, filename: '', resourceRows: [], resourceHeaders: [], resourceMapping: {}, resourceMappingIssues: [], reliefResources: [], resourceValidation: null, resourceFilename: '', resourceSource: '', comparisonSize: 10, currentResources: [], latest: null, latestBenchmarks: [], results: {}, history: JSON.parse(localStorage.getItem('allocation-history') || '[]'), weights: deriveAHPWeights(), geocodeCache: JSON.parse(localStorage.getItem(GEOCODE_CACHE_KEY) || '{}'), processing: false, resourceProcessing: false, comparing: false };
 const DEMO_HOUSEHOLD_HEADERS = ['household', 'address', 'latitude', 'longitude', 'urgency', 'compatible_resource', 'verification', 'vulnerability_factors'];
 const DEMO_RESOURCE_HEADERS = ['resource_id', 'resource_type', 'latitude', 'longitude', 'quantity', 'availability'];
 const VARIED_DEMO_HOUSEHOLDS = Object.freeze([
@@ -341,7 +344,7 @@ function reportRunError(error, fallback = 'Run failed') {
   if (typeof console !== 'undefined') console.error('[Allocation Lab]', error);
   toast(error?.message || fallback);
 }
-function go(page) { if (!['existing', 'enhanced', 'compare', 'history'].includes(page)) page = 'compare'; document.querySelectorAll('.view').forEach(view => view.classList.toggle('active', view.id === `view-${page}`)); document.querySelectorAll('.nav-item[data-page]').forEach(item => item.classList.toggle('active', item.dataset.page === page)); const labels = { existing: 'Existing Algorithm', enhanced: 'Enhanced Algorithm', compare: 'Comparison', history: 'History' }; const titles = { existing: 'Standard Hungarian Algorithm - Distance-Only Baseline', enhanced: 'Enhanced Multi-Objective Weighted Hungarian Algorithm', compare: 'Research Comparison', history: 'Run History' }; $('#page-title').textContent = labels[page]; $('#header-title').textContent = titles[page]; window.scrollTo(0, 0); }
+function go(page) { if (!['existing', 'enhanced', 'compare', 'history'].includes(page)) page = 'compare'; document.querySelectorAll('.view').forEach(view => view.classList.toggle('active', view.id === `view-${page}`)); document.querySelectorAll('.nav-item[data-page]').forEach(item => item.classList.toggle('active', item.dataset.page === page)); const labels = { existing: 'Standard', enhanced: 'Enhanced', compare: 'Compare', history: 'History' }; const titles = { existing: 'Standard Hungarian Algorithm - Distance-Only Baseline', enhanced: 'Enhanced Multi-Objective Weighted Hungarian Algorithm', compare: 'Compare Allocation Results', history: 'Run History' }; $('#page-title').textContent = labels[page]; $('#header-title').textContent = titles[page]; window.scrollTo(0, 0); }
 function parseCsvRecords(text) {
   const rows = [];
   let row = [];
@@ -482,7 +485,7 @@ async function loadFile(file) {
     logAllocationDiagnostics(`${extension?.toUpperCase() || 'Dataset'} upload: ${file.name}`);
     renderDataset();
     go('compare');
-    toast(state.mappingIssues.some(issue => issue.level === 'error') ? 'Review column mapping before validation' : 'Dataset imported; ready to geocode and validate');
+    toast(state.mappingIssues.some(issue => issue.level === 'error') ? 'Dataset columns could not be auto-detected' : 'Dataset imported; ready to geocode and validate');
   } catch (error) {
     toast(error.message === 'xlsx-library-missing' ? 'XLSX parser is unavailable' : error.message || 'Could not parse this file');
   }
@@ -653,10 +656,30 @@ function distance(row, resourceIndex = null) {
   return geoDistanceKm(origin, [Number(row.latitude), Number(row.longitude)]);
 }
 function hungarian(matrix) { const n = matrix.length, m = matrix[0].length, u = Array(n + 1).fill(0), v = Array(m + 1).fill(0), p = Array(m + 1).fill(0), way = Array(m + 1).fill(0); for (let i = 1; i <= n; i++) { p[0] = i; let j0 = 0; const minv = Array(m + 1).fill(Infinity), used = Array(m + 1).fill(false); do { used[j0] = true; const i0 = p[j0]; let delta = Infinity, j1 = 0; for (let j = 1; j <= m; j++) if (!used[j]) { const cur = matrix[i0 - 1][j - 1] - u[i0] - v[j]; if (cur < minv[j]) { minv[j] = cur; way[j] = j0; } if (minv[j] < delta) { delta = minv[j]; j1 = j; } } for (let j = 0; j <= m; j++) { if (used[j]) { u[p[j]] += delta; v[j] -= delta; } else minv[j] -= delta; } j0 = j1; } while (p[j0] !== 0); do { const j1 = way[j0]; p[j0] = p[j1]; j0 = j1; } while (j0 !== 0); } const result = Array(n); for (let j = 1; j <= m; j++) result[p[j] - 1] = j - 1; return result; }
+function sanitizeSolverMatrix(matrix) {
+  if (!matrix?.length || !matrix[0]?.length) throw new Error('No valid assignment matrix could be built for the selected pair count');
+  const finiteValues = matrix.flat().map(Number).filter(Number.isFinite);
+  if (!finiteValues.length) throw new Error('Selected households or resources are missing valid coordinates');
+  const maxFinite = Math.max(...finiteValues);
+  const penalty = Math.max(maxFinite * 1000, 1000000);
+  return matrix.map(row => row.map(value => Number.isFinite(Number(value)) ? Number(value) : penalty));
+}
 function getNormalizationScale(values) {
   const numeric = values.map(Number).filter(Number.isFinite);
   if (!numeric.length) return { min: 0, max: 0 };
   return { min: Math.min(...numeric), max: Math.max(...numeric) };
+}
+
+function getMatrixNormalizationScale(matrix) {
+  let min = Infinity;
+  let max = -Infinity;
+  (matrix || []).forEach(row => (row || []).forEach(value => {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return;
+    if (numeric < min) min = numeric;
+    if (numeric > max) max = numeric;
+  }));
+  return min === Infinity ? { min: 0, max: 0 } : { min, max };
 }
 
 function normalizeByScale(value, scale) {
@@ -709,13 +732,16 @@ function getUrgencyPriorityScore(row, rows) {
 }
 
 function buildExistingCostMatrix(rows, activeResources) {
+  const started = performance.now();
   // Standard Hungarian baseline: distance is the only optimization criterion.
   // Equal-distance ties follow stable resource/household input order; no urgency,
   // priority, vulnerability, or compatibility fields are inspected here.
-  return { matrix: buildDistanceMatrix(rows, activeResources), components: null };
+  const matrix = buildDistanceMatrix(rows, activeResources);
+  return { matrix, components: null, matrixPhaseTimings: { matrixConstructionMs: performance.now() - started, normalizationMs: 0 } };
 }
 
 function buildEnhancedCostMatrix(rows, activeResources) {
+  const started = performance.now();
   const distances = buildDistanceMatrix(rows, activeResources);
   const urgency = activeResources.map(resource => rows.map(row => {
     const compatibilityScore = getHouseholdResourceCompatibilityScore(row, resource.resource_type);
@@ -726,6 +752,7 @@ function buildEnhancedCostMatrix(rows, activeResources) {
     const score = getHouseholdResourceCompatibilityScore(row, resource.resource_type);
     return 1 - (isFiniteNumber(score) ? Number(score) : 0);
   }));
+  const criteriaEnded = performance.now();
   const scales = {
     distance: getNormalizationScale(distances.flat()),
     urgency: getNormalizationScale(urgency.flat()),
@@ -734,17 +761,27 @@ function buildEnhancedCostMatrix(rows, activeResources) {
   const flatDistance = distances.flat().map(value => normalizeByScale(value, scales.distance));
   const flatUrgency = urgency.flat().map(value => normalizeByScale(value, scales.urgency));
   const flatCompatibility = compatibility.flat().map(value => normalizeByScale(value, scales.compatibility));
+  const normalizationEnded = performance.now();
   const components = activeResources.map((_, resourceIndex) => rows.map((__, householdIndex) => {
     const index = resourceIndex * rows.length + householdIndex;
-    const distanceComponent = flatDistance[index] * state.weights.distance;
-    const urgencyComponent = flatUrgency[index] * state.weights.urgency;
-    const compatibilityComponent = flatCompatibility[index] * state.weights.compatibility;
+    const distanceComponent = flatDistance[index] * RESEARCH_WEIGHTS.distance;
+    const urgencyComponent = flatUrgency[index] * RESEARCH_WEIGHTS.urgency;
+    const compatibilityComponent = flatCompatibility[index] * RESEARCH_WEIGHTS.compatibility;
     return { distanceComponent, urgencyComponent, compatibilityComponent };
   }));
   return {
     matrix: components.map(row => row.map(item => item.distanceComponent + item.urgencyComponent + item.compatibilityComponent)),
     components,
-    componentScales: scales
+    componentScales: scales,
+    matrixPhaseTimings: {
+      matrixConstructionMs: (criteriaEnded - started) + (performance.now() - normalizationEnded),
+      normalizationMs: normalizationEnded - criteriaEnded
+    },
+    criteriaMatrices: {
+      distance: distances.map(row => row.slice()),
+      urgency: urgency.map(row => row.slice()),
+      compatibility: compatibility.map(row => row.slice())
+    }
   };
 }
 
@@ -804,12 +841,15 @@ function formatCoefficient(value) {
 function formatNativeCost(result) {
   if (!result) return 'N/A';
   return result.mode === 'existing'
-    ? `${round(result.cost, 3)} km`
-    : round(result.cost, 3);
+    ? `Distance Cost: ${round(result.cost, 3)} km`
+    : `Weighted Composite Cost: ${round(result.cost, 3)}`;
 }
 
 function formatDurationMs(value) {
-  return isFiniteNumber(value) ? `${Number(value).toFixed(2)} ms` : 'N/A';
+  if (!isFiniteNumber(value)) return 'N/A';
+  const numeric = Number(value);
+  if (numeric >= 0 && numeric < 0.01) return '<0.01 ms';
+  return `${numeric.toFixed(2)} ms`;
 }
 
 function formatDifferenceValue(value, formatter, digits = 2) {
@@ -918,9 +958,9 @@ function computeEnhancedCostEntry(row, rows, resource, resourceIndex, householdI
   const compatibilityScore = getHouseholdResourceCompatibilityScore(row, resource.resource_type);
   const compatibilityGap = 1 - (isFiniteNumber(compatibilityScore) ? Number(compatibilityScore) : 0);
   const urgencyPenalty = getUrgencyPriorityScore(row, rows) * compatibilityGap;
-  const distanceComponent = normalizeByScale(distance(row, resourceIndex), scales.distance) * state.weights.distance;
-  const urgencyComponent = normalizeByScale(urgencyPenalty, scales.urgency) * state.weights.urgency;
-  const compatibilityComponent = normalizeByScale(compatibilityGap, scales.compatibility) * state.weights.compatibility;
+  const distanceComponent = normalizeByScale(distance(row, resourceIndex), scales.distance) * RESEARCH_WEIGHTS.distance;
+  const urgencyComponent = normalizeByScale(urgencyPenalty, scales.urgency) * RESEARCH_WEIGHTS.urgency;
+  const compatibilityComponent = normalizeByScale(compatibilityGap, scales.compatibility) * RESEARCH_WEIGHTS.compatibility;
   return {
     value: distanceComponent + urgencyComponent + compatibilityComponent,
     components: { distanceComponent, urgencyComponent, compatibilityComponent },
@@ -928,23 +968,114 @@ function computeEnhancedCostEntry(row, rows, resource, resourceIndex, householdI
   };
 }
 
+function getEnhancedEntryFromCriteria(criteriaMatrices, scales, resourceIndex, householdIndex) {
+  const distanceComponent = normalizeByScale(criteriaMatrices.distance?.[resourceIndex]?.[householdIndex], scales.distance) * RESEARCH_WEIGHTS.distance;
+  const urgencyComponent = normalizeByScale(criteriaMatrices.urgency?.[resourceIndex]?.[householdIndex], scales.urgency) * RESEARCH_WEIGHTS.urgency;
+  const compatibilityComponent = normalizeByScale(criteriaMatrices.compatibility?.[resourceIndex]?.[householdIndex], scales.compatibility) * RESEARCH_WEIGHTS.compatibility;
+  return {
+    value: distanceComponent + urgencyComponent + compatibilityComponent,
+    components: { distanceComponent, urgencyComponent, compatibilityComponent },
+    householdIndex
+  };
+}
+
+function cloneCriteriaMatrices(criteriaMatrices) {
+  return {
+    distance: criteriaMatrices?.distance || [],
+    urgency: (criteriaMatrices?.urgency || []).map(row => row.slice()),
+    compatibility: criteriaMatrices?.compatibility || []
+  };
+}
+
+function getUpdatedEnhancedCriteriaState(currentResult, updatedRows, activeResources, affectedIndexes) {
+  const sourceCriteria = currentResult?.criteriaMatrices || buildEnhancedCostMatrix(updatedRows, activeResources).criteriaMatrices;
+  const criteriaMatrices = cloneCriteriaMatrices(sourceCriteria);
+  affectedIndexes.forEach(householdIndex => {
+    const urgencyScore = getUrgencyPriorityScore(updatedRows[householdIndex], updatedRows);
+    activeResources.forEach((resource, resourceIndex) => {
+      const compatibilityGap = criteriaMatrices.compatibility?.[resourceIndex]?.[householdIndex] ?? 0;
+      criteriaMatrices.urgency[resourceIndex][householdIndex] = urgencyScore * compatibilityGap;
+    });
+  });
+  const componentScales = {
+    distance: currentResult?.componentScales?.distance || getMatrixNormalizationScale(criteriaMatrices.distance),
+    urgency: getMatrixNormalizationScale(criteriaMatrices.urgency),
+    compatibility: currentResult?.componentScales?.compatibility || getMatrixNormalizationScale(criteriaMatrices.compatibility)
+  };
+  return { criteriaMatrices, componentScales };
+}
+
+function getOutputHouseholdIndex(item, rows) {
+  if (typeof item?.householdIndex === 'number' && rows[item.householdIndex]) return item.householdIndex;
+  const id = getHouseholdId(item?.household);
+  return rows.findIndex(row => row === item?.household || (id && getHouseholdId(row) === id));
+}
+
+function refreshAssignmentHouseholds(output, rows) {
+  return (output || []).map(item => {
+    const householdIndex = getOutputHouseholdIndex(item, rows);
+    if (householdIndex < 0) return { ...item };
+    const household = rows[householdIndex];
+    return {
+      ...item,
+      household,
+      householdIndex,
+      distanceKm: distance(household, item.resourceIndex)
+    };
+  });
+}
+
+function getTopResourceIndexesForHousehold(matrix, householdIndex, limit = SELECTIVE_REASSIGNMENT_CANDIDATE_RESOURCES) {
+  return matrix
+    .map((row, resourceIndex) => ({ resourceIndex, value: row?.[householdIndex] }))
+    .filter(item => isFiniteNumber(item.value))
+    .sort((a, b) => Number(a.value) - Number(b.value) || a.resourceIndex - b.resourceIndex)
+    .slice(0, limit)
+    .map(item => item.resourceIndex);
+}
+
+function getTopResourceIndexesForHouseholdFromCriteria(criteriaState, householdIndex, limit = SELECTIVE_REASSIGNMENT_CANDIDATE_RESOURCES) {
+  return criteriaState.criteriaMatrices.distance
+    .map((_, resourceIndex) => ({ resourceIndex, value: getEnhancedEntryFromCriteria(criteriaState.criteriaMatrices, criteriaState.componentScales, resourceIndex, householdIndex).value }))
+    .filter(item => isFiniteNumber(item.value))
+    .sort((a, b) => Number(a.value) - Number(b.value) || a.resourceIndex - b.resourceIndex)
+    .slice(0, limit)
+    .map(item => item.resourceIndex);
+}
+
 function selectiveEnhancedReassignment(currentResult, updatedRows, activeResources, affectedIndexes) {
   const started = performance.now();
   state.currentResources = activeResources;
   const currentOutput = (currentResult?.output || []).map(item => ({ ...item }));
   const currentMaps = getResultAssignmentMaps(currentResult);
+  const prepEnded = performance.now();
+  const criteriaState = getUpdatedEnhancedCriteriaState(currentResult, updatedRows, activeResources, affectedIndexes);
+  const criteriaEnded = performance.now();
   const affectedAssignments = affectedIndexes
     .map(householdIndex => getResultAssignmentForRow(currentResult, updatedRows[householdIndex], currentMaps))
     .filter(Boolean);
-  const resourceIndexes = [...new Set(affectedAssignments.map(item => item.resourceIndex).filter(index => typeof index === 'number'))];
-  if (!affectedIndexes.length || !resourceIndexes.length) {
+  const candidateResourceIndexes = new Set(affectedAssignments.map(item => item.resourceIndex).filter(index => typeof index === 'number'));
+  affectedIndexes.forEach(householdIndex => {
+    getTopResourceIndexesForHouseholdFromCriteria(criteriaState, householdIndex).forEach(resourceIndex => candidateResourceIndexes.add(resourceIndex));
+  });
+  const candidateHouseholdIndexes = new Set(affectedIndexes);
+  currentOutput.forEach(item => {
+    if (!candidateResourceIndexes.has(item.resourceIndex)) return;
+    const householdIndex = getOutputHouseholdIndex(item, updatedRows);
+    if (householdIndex >= 0) candidateHouseholdIndexes.add(householdIndex);
+  });
+  const resourceIndexes = [...candidateResourceIndexes].filter(index => typeof index === 'number' && activeResources[index]);
+  const householdIndexes = [...candidateHouseholdIndexes].filter(index => typeof index === 'number' && updatedRows[index]);
+  if (!affectedIndexes.length || !resourceIndexes.length || !householdIndexes.length) {
     return { ...currentResult, output: currentOutput, durationMs: performance.now() - started, affectedCount: 0 };
   }
-  const scales = currentResult.componentScales || buildEnhancedCostMatrix(updatedRows, activeResources).componentScales;
-  const subEntries = resourceIndexes.map(resourceIndex => affectedIndexes.map(householdIndex => (
-    computeEnhancedCostEntry(updatedRows[householdIndex], updatedRows, activeResources[resourceIndex], resourceIndex, householdIndex, scales)
+  const selectionEnded = performance.now();
+  const subEntries = resourceIndexes.map(resourceIndex => householdIndexes.map(householdIndex => (
+    getEnhancedEntryFromCriteria(criteriaState.criteriaMatrices, criteriaState.componentScales, resourceIndex, householdIndex)
   )));
-  const subAssignment = hungarian(subEntries.map(row => row.map(item => item.value)));
+  const subproblemEnded = performance.now();
+  const subAssignment = hungarian(sanitizeSolverMatrix(subEntries.map(row => row.map(item => item.value))));
+  const hungarianEnded = performance.now();
   const outputByResource = new Map(currentOutput.map(item => [item.resourceIndex, item]));
   subAssignment.forEach((assignedHouseholdPosition, resourcePosition) => {
     const resourceIndex = resourceIndexes[resourcePosition];
@@ -956,14 +1087,24 @@ function selectiveEnhancedReassignment(currentResult, updatedRows, activeResourc
       resourceName: resourceLabel(resourceIndex),
       resourceType: resourceType(resourceIndex),
       household,
+      householdIndex: entry.householdIndex,
       value: entry.value,
       distanceKm: distance(household, resourceIndex),
       components: entry.components
     });
   });
-  const output = currentOutput.map(item => outputByResource.get(item.resourceIndex) || item);
-  const durationMs = performance.now() - started;
+  const algorithmOutput = currentOutput.map(item => outputByResource.get(item.resourceIndex) || item);
+  const assignmentEnded = performance.now();
+  const durationMs = assignmentEnded - started;
+  const output = refreshAssignmentHouseholds(algorithmOutput, updatedRows)
+    .map(item => {
+      const householdIndex = getOutputHouseholdIndex(item, updatedRows);
+      if (householdIndex < 0) return item;
+      const entry = getEnhancedEntryFromCriteria(criteriaState.criteriaMatrices, criteriaState.componentScales, item.resourceIndex, householdIndex);
+      return { ...item, value: entry.value, components: entry.components };
+    });
   const metrics = calculateAssignmentMetrics(output, updatedRows);
+  const postEnded = performance.now();
   return {
     ...currentResult,
     output,
@@ -976,7 +1117,19 @@ function selectiveEnhancedReassignment(currentResult, updatedRows, activeResourc
     prioritization: metrics.prioritizationEfficiency,
     duration: durationMs.toFixed(2),
     durationMs,
+    phaseTimings: {
+      preprocessingMs: prepEnded - started,
+      criteriaUpdateMs: criteriaEnded - prepEnded,
+      candidateSelectionMs: selectionEnded - criteriaEnded,
+      subproblemBuildMs: subproblemEnded - selectionEnded,
+      hungarianMs: hungarianEnded - subproblemEnded,
+      assignmentUpdateMs: assignmentEnded - hungarianEnded,
+      postProcessingMs: postEnded - assignmentEnded,
+      uiRenderingMs: 0
+    },
     householdOrder: updatedRows.map(row => getHouseholdId(row) || row.household_id || ''),
+    componentScales: criteriaState.componentScales,
+    criteriaMatrices: criteriaState.criteriaMatrices,
     metrics
   };
 }
@@ -992,8 +1145,20 @@ function simulateDynamicReassignment(enhanced, rows, activeResources) {
   let enhancedDurationMs = 0;
   const eventDetails = events.map(event => {
     const previousAssignment = getResultAssignmentForRow(currentEnhanced, enhancedRows[event.householdIndex]);
+    const previousCompositeCost = computeComparableWeightedCost(currentEnhanced, enhancedRows, activeResources);
     if (!event.triggered) {
-      return { household: enhancedRows[event.householdIndex], ...event, previousAssignment, updatedAssignment: previousAssignment, changed: false, standardMs: 0, enhancedMs: 0 };
+      return {
+        household: enhancedRows[event.householdIndex],
+        ...event,
+        previousAssignment,
+        updatedAssignment: previousAssignment,
+        previousCompositeCost,
+        updatedCompositeCost: previousCompositeCost,
+        compositeCostDiff: 0,
+        changed: false,
+        standardMs: 0,
+        enhancedMs: 0
+      };
     }
     standardRows = applyDynamicEventRows(standardRows, event);
     enhancedRows = applyDynamicEventRows(enhancedRows, event);
@@ -1002,11 +1167,15 @@ function simulateDynamicReassignment(enhanced, rows, activeResources) {
     standardDurationMs += standardRecomputed.durationMs;
     enhancedDurationMs += currentEnhanced.durationMs;
     const updatedAssignment = getResultAssignmentForRow(currentEnhanced, enhancedRows[event.householdIndex]);
+    const updatedCompositeCost = computeComparableWeightedCost(currentEnhanced, enhancedRows, activeResources);
     return {
       household: enhancedRows[event.householdIndex],
       ...event,
       previousAssignment,
       updatedAssignment,
+      previousCompositeCost,
+      updatedCompositeCost,
+      compositeCostDiff: isFiniteNumber(previousCompositeCost) && isFiniteNumber(updatedCompositeCost) ? updatedCompositeCost - previousCompositeCost : null,
       changed: previousAssignment?.resourceIndex !== updatedAssignment?.resourceIndex,
       standardMs: standardRecomputed.durationMs,
       enhancedMs: currentEnhanced.durationMs
@@ -1145,13 +1314,17 @@ function calculateAssignmentMetrics(output, rows) {
 function runAssignment(mode, rows, activeResources) {
   const started = performance.now();
   state.currentResources = activeResources;
-  const { matrix, components, componentScales } = makeMatrix(mode, rows, activeResources);
+  const preprocessingEnded = performance.now();
+  const { matrix, components, componentScales, criteriaMatrices, matrixPhaseTimings } = makeMatrix(mode, rows, activeResources);
+  const matrixEnded = performance.now();
   logAlgorithmCriteriaDiagnostics(mode, matrix, activeResources.length);
   const resourcesExceedHouseholds = activeResources.length > rows.length;
   const solverMatrix = resourcesExceedHouseholds
     ? rows.map((_, householdIndex) => activeResources.map((__, resourceIndex) => matrix[resourceIndex][householdIndex]))
     : matrix;
-  const assignment = hungarian(solverMatrix);
+  const solverStarted = performance.now();
+  const assignment = hungarian(sanitizeSolverMatrix(solverMatrix));
+  const solverEnded = performance.now();
   const output = assignment.map((assignedIndex, index) => {
     const resourceIndex = resourcesExceedHouseholds ? assignedIndex : index;
     const householdIndex = resourcesExceedHouseholds ? index : assignedIndex;
@@ -1162,13 +1335,16 @@ function runAssignment(mode, rows, activeResources) {
       resourceName: resourceLabel(resourceIndex),
       resourceType: resourceType(resourceIndex),
       household,
+      householdIndex,
       value: matrix[resourceIndex][householdIndex],
       distanceKm: distance(household, resourceIndex),
       components: components?.[resourceIndex]?.[householdIndex] || null
     };
   }).filter(item => item.household);
-  const durationMs = performance.now() - started;
+  const outputEnded = performance.now();
+  const durationMs = matrixEnded - preprocessingEnded + solverEnded - solverStarted + outputEnded - solverEnded;
   const metrics = calculateAssignmentMetrics(output, rows);
+  const postEnded = performance.now();
   return {
     mode,
     output,
@@ -1181,6 +1357,15 @@ function runAssignment(mode, rows, activeResources) {
     prioritization: metrics.prioritizationEfficiency,
     duration: durationMs.toFixed(2),
     durationMs,
+    phaseTimings: {
+      preprocessingMs: preprocessingEnded - started,
+      normalizationMs: matrixPhaseTimings?.normalizationMs || 0,
+      matrixConstructionMs: matrixPhaseTimings?.matrixConstructionMs ?? (matrixEnded - preprocessingEnded),
+      hungarianMs: solverEnded - solverStarted,
+      assignmentOutputMs: outputEnded - solverEnded,
+      postProcessingMs: postEnded - outputEnded,
+      uiRenderingMs: 0
+    },
     dataset: state.filename,
     records: rows.length,
     resourceCount: activeResources.length,
@@ -1192,6 +1377,7 @@ function runAssignment(mode, rows, activeResources) {
     matrixValues: matrix.flat().filter(isFiniteNumber).map(Number),
     costMatrix: matrix.map(row => row.slice()),
     componentScales,
+    criteriaMatrices,
     metrics,
     weights: { ...state.weights }
   };
@@ -1369,10 +1555,15 @@ function getHighUrgencyServiceRate(result) {
   return total ? result.metrics.highUrgencyCorrect / total : null;
 }
 
-function formatHighUrgencyServed(result) {
+function formatHighUrgencyCompatibleRate(result) {
   const total = result?.metrics?.highUrgencyTotal;
-  if (!total) return 'Not measurable - no high-urgency households in selected dataset';
-  return `${result.metrics.highUrgencyCorrect} / ${total}`;
+  if (!total) return 'Not measurable for this dataset';
+  const compatible = result.metrics.highUrgencyCorrect;
+  return `${formatPercent(compatible / total)} (${compatible} / ${total})`;
+}
+
+function formatHighUrgencyServed(result) {
+  return formatHighUrgencyCompatibleRate(result);
 }
 
 function compareHighUrgencyPriority(standard, enhanced) {
@@ -1384,9 +1575,9 @@ function compareHighUrgencyPriority(standard, enhanced) {
 function formatHighUrgencyChange(standard, enhanced) {
   const standardRate = getHighUrgencyServiceRate(standard);
   const enhancedRate = getHighUrgencyServiceRate(enhanced);
-  if (!isFiniteNumber(standardRate) || !isFiniteNumber(enhancedRate)) return 'Requires high-urgency H*';
+  if (!isFiniteNumber(standardRate) || !isFiniteNumber(enhancedRate)) return 'Not measurable for this dataset';
   const countDiff = enhanced.metrics.highUrgencyCorrect - standard.metrics.highUrgencyCorrect;
-  return `${formatHighUrgencyServed(standard)} -> ${formatHighUrgencyServed(enhanced)} (${formatSignedInteger(countDiff)} households; ${formatPercentagePoint(enhancedRate - standardRate)})`;
+  return `${formatPercentagePoint(enhancedRate - standardRate)} (${formatSignedInteger(countDiff)} compatible assignments)`;
 }
 
 function formatCoefficientChange(standard, enhanced) {
@@ -1418,23 +1609,26 @@ function formatDynamicImprovement(value, savedMs) {
   return formatPercent(value);
 }
 
-function formatSop1Outcome(existing, enhanced, existingComparableCost, enhancedComparableCost) {
-  const accuracyDiff = enhanced.metrics.allocationAccuracy - existing.metrics.allocationAccuracy;
-  const priorityDiff = enhanced.metrics.prioritizationEfficiency - existing.metrics.prioritizationEfficiency;
-  const compositeDiff = enhancedComparableCost - existingComparableCost;
-  const improvements = [
-    isFiniteNumber(accuracyDiff) && accuracyDiff > 0.0005,
-    isFiniteNumber(priorityDiff) && priorityDiff > 0.0005,
-    isFiniteNumber(compositeDiff) && compositeDiff < -0.0005
-  ].filter(Boolean).length;
-  if (improvements) return `Enhanced improves ${improvements} multi-objective indicator${improvements === 1 ? '' : 's'} in this run.`;
-  const ties = [
-    isFiniteNumber(accuracyDiff) && Math.abs(accuracyDiff) <= 0.0005,
-    isFiniteNumber(priorityDiff) && Math.abs(priorityDiff) <= 0.0005,
-    isFiniteNumber(compositeDiff) && Math.abs(compositeDiff) <= 0.0005
-  ].filter(Boolean).length;
-  if (ties >= 2) return 'No visible SOP 1 improvement in this run; the selected data may not create enough distance-compatibility-urgency conflict.';
-  return 'Enhanced does not outperform the baseline on the measured SOP 1 indicators in this run.';
+function describeMetricDirection(label, standard, enhanced, formatter, higherIsBetter = true) {
+  if (!isFiniteNumber(standard) || !isFiniteNumber(enhanced)) return `${label} was not measurable for this dataset.`;
+  const diff = Number(enhanced) - Number(standard);
+  if (Math.abs(diff) <= 0.0005) return `${label} was unchanged at ${formatter(enhanced)}.`;
+  const direction = higherIsBetter
+    ? (diff > 0 ? 'higher for Enhanced' : 'higher for Standard')
+    : (diff < 0 ? 'lower for Enhanced' : 'lower for Standard');
+  return `${label} was ${direction} (${formatter(standard)} vs ${formatter(enhanced)}).`;
+}
+
+function renderSop1Interpretation(existing, enhanced, changedCount, rows, existingComparableCost, enhancedComparableCost) {
+  const statements = [
+    describeMetricDirection('Mean allocation accuracy', existing.metrics.allocationAccuracy, enhanced.metrics.allocationAccuracy, formatPercent, true),
+    describeMetricDirection('Prioritization efficiency', existing.metrics.prioritizationEfficiency, enhanced.metrics.prioritizationEfficiency, formatPercent, true),
+    'High-urgency compatible assignment rate is marked as threshold not defined because Chapter 1-3 does not formalize a high-urgency cutoff.',
+    describeMetricDirection('Total physical distance', existing.metrics.totalDistance, enhanced.metrics.totalDistance, value => formatDistanceKm(value), false),
+    describeMetricDirection('Common composite cost', existingComparableCost, enhancedComparableCost, value => round(value, 3), false),
+    `Assignments changed: ${formatAssignmentComparisonResult(changedCount, rows.length)}.`
+  ];
+  return `<details class="comparison-note-box sop-interpretation"><summary>SOP 1 interpretation</summary>${statements.map(statement => `<p>${escapeHtml(statement)}</p>`).join('')}</details>`;
 }
 
 function compareFasterInThisRun(standardMs, enhancedMs) {
@@ -1513,9 +1707,7 @@ function getComparisonDataNotes(existing, enhanced, householdRows, rows, activeR
   if (!hasCompatibilityConflict(rows, activeResources)) {
     notes.push('No compatibility conflict exists in this dataset.');
   }
-  if (!existing?.metrics?.highUrgencyTotal && !enhanced?.metrics?.highUrgencyTotal) {
-    notes.push(`Not measurable - no high-urgency households in selected dataset. The high-urgency threshold is ${getHighUrgencyThreshold(rows)} for the detected urgency scale.`);
-  }
+  notes.push('High-urgency compatible assignment rate is not calculated as a primary metric because Chapter 1-3 does not define a high-urgency cutoff.');
   return notes;
 }
 
@@ -1561,18 +1753,254 @@ function bindComparisonReport(rows) {
   else detail.innerHTML = renderHouseholdChangeDetail(null);
 }
 
-function runDynamicPerformanceBenchmark(rows, activeResources) {
+function median(values) {
+  const numeric = values.map(Number).filter(Number.isFinite).sort((a, b) => a - b);
+  if (!numeric.length) return null;
+  const middle = Math.floor(numeric.length / 2);
+  return numeric.length % 2 ? numeric[middle] : (numeric[middle - 1] + numeric[middle]) / 2;
+}
+
+function mean(values) {
+  const numeric = values.map(Number).filter(Number.isFinite);
+  return numeric.length ? numeric.reduce((sum, value) => sum + value, 0) / numeric.length : null;
+}
+
+function standardDeviation(values) {
+  const numeric = values.map(Number).filter(Number.isFinite);
+  if (numeric.length < 2) return 0;
+  const avg = mean(numeric);
+  const variance = numeric.reduce((sum, value) => sum + ((value - avg) ** 2), 0) / (numeric.length - 1);
+  return Math.sqrt(variance);
+}
+
+function summarizeSamples(values) {
+  const numeric = values.map(Number).filter(Number.isFinite);
+  return {
+    median: median(numeric),
+    mean: mean(numeric),
+    sd: standardDeviation(numeric),
+    count: numeric.length
+  };
+}
+
+function addPhaseTimings(target, source) {
+  Object.entries(source || {}).forEach(([key, value]) => {
+    target[key] = (target[key] || 0) + (Number(value) || 0);
+  });
+  return target;
+}
+
+function summarizePhaseTimings(samples, selector) {
+  const keys = ['preprocessingMs', 'matrixConstructionMs', 'criteriaUpdateMs', 'candidateSelectionMs', 'subproblemBuildMs', 'hungarianMs', 'assignmentOutputMs', 'assignmentUpdateMs', 'postProcessingMs', 'uiRenderingMs'];
+  return Object.fromEntries(keys.map(key => [key, summarizeSamples(samples.map(sample => selector(sample)?.[key]))]));
+}
+
+function formatTimingSummary(summary) {
+  if (!summary || !isFiniteNumber(summary.median)) return 'N/A';
+  return `${formatDurationMs(summary.median)} median<br><small>mean ${formatDurationMs(summary.mean)} +/- ${formatDurationMs(summary.sd)}</small>`;
+}
+
+function getSummaryMedian(summary) {
+  return isFiniteNumber(summary?.median) ? Number(summary.median) : null;
+}
+
+function renderSop3Interpretation(benchmarks) {
+  const complete = benchmarks.filter(row => row.status === 'Complete');
+  const row = complete[complete.length - 1];
+  if (!row) return '';
+  const standardInitial = getSummaryMedian(row.standardInitial);
+  const enhancedInitial = getSummaryMedian(row.enhancedInitial);
+  const standardOverall = getSummaryMedian(row.standardOverall);
+  const enhancedOverall = getSummaryMedian(row.enhancedOverall);
+  const initialDiff = enhancedInitial - standardInitial;
+  const overallDiff = enhancedOverall - standardOverall;
+  const practicalLimitMs = 1000;
+  const statements = [];
+  if (isFiniteNumber(initialDiff)) {
+    if (initialDiff > 0) statements.push(`At ${row.size}x${row.size}, Enhanced initial assignment added ${formatDurationMs(initialDiff)} of computational overhead because it evaluates distance, urgency, and compatibility.`);
+    else if (initialDiff < 0) statements.push(`At ${row.size}x${row.size}, Enhanced initial assignment was ${formatDurationMs(Math.abs(initialDiff))} faster in the median run.`);
+    else statements.push(`At ${row.size}x${row.size}, both algorithms had the same median initial assignment time.`);
+  }
+  if (isFiniteNumber(row.savedMs)) {
+    if (row.savedMs > 0) statements.push(`Dynamic re-assignment saved ${formatDurationMs(row.savedMs)} across the five qualifying events.`);
+    else if (row.savedMs < 0) statements.push(`Dynamic re-assignment was ${formatDurationMs(Math.abs(row.savedMs))} slower for Enhanced across the five qualifying events.`);
+    else statements.push('Dynamic re-assignment time was tied across the five qualifying events.');
+  }
+  if (isFiniteNumber(overallDiff)) {
+    if (overallDiff > 0) {
+      statements.push(`Overall execution was ${formatDurationMs(overallDiff)} slower for Enhanced after five events. Existing is faster in this measurement because it optimizes only distance.`);
+    }
+    else if (overallDiff < 0) statements.push(`Overall execution was ${formatDurationMs(Math.abs(overallDiff))} faster for Enhanced after five events.`);
+    else statements.push('Overall execution time was tied after five events.');
+  }
+  if (row.savedMs > 0 && row.breakEven?.events !== null) statements.push(`Break-even estimate: ${row.breakEven?.label || 'N/A'}.`);
+  if (isFiniteNumber(enhancedOverall) && enhancedOverall < practicalLimitMs) statements.push(`Enhanced remained within practical millisecond-level runtime for the tested ${row.size}x${row.size} matrix, but this is not a computational speed advantage over Existing.`);
+  return `<details class="comparison-note-box sop-interpretation"><summary>SOP 3 timing interpretation</summary>${statements.map(statement => `<p>${escapeHtml(statement)}</p>`).join('')}</details>`;
+}
+
+function renderSop2Interpretation(dynamic) {
+  if (!dynamic.events.length) return '';
+  const statements = [];
+  const triggeredCount = dynamic.events.filter(event => event.triggered).length;
+  statements.push(`${triggeredCount} of ${dynamic.events.length} controlled urgency-change events met the Delta >= 2 trigger rule.`);
+  const diff = dynamic.durationMs - dynamic.standardDurationMs;
+  if (isFiniteNumber(diff)) {
+    if (diff > 0) statements.push(`Enhanced selective re-assignment was ${formatDurationMs(diff)} slower than Existing full recomputation in this application-runtime measurement.`);
+    else if (diff < 0) statements.push(`Enhanced selective re-assignment was ${formatDurationMs(Math.abs(diff))} faster than Existing full recomputation in this application-runtime measurement.`);
+    else statements.push('Enhanced and Existing dynamic re-assignment time were tied in this application-runtime measurement.');
+  }
+  statements.push(dynamic.events.some(event => event.changed)
+    ? 'At least one event changed the final household-resource pairing after recomputation.'
+    : 'The final assignment remained the same after recomputation; this is valid when the checked optimum is unchanged.');
+  return `<details class="comparison-note-box sop-interpretation"><summary>SOP 2 interpretation</summary>${statements.map(statement => `<p>${escapeHtml(statement)}</p>`).join('')}</details>`;
+}
+
+function getSupportStatus(score, possible) {
+  if (!possible) return 'Not Supported';
+  if (score >= possible) return 'Supported';
+  return score > 0 ? 'Partially Supported' : 'Not Supported';
+}
+
+function getObjectiveStatuses(existing, enhanced, dynamic, benchmarks, existingComparableCost, enhancedComparableCost) {
+  const sop1Indicators = [
+    enhanced.metrics.allocationAccuracy > existing.metrics.allocationAccuracy,
+    enhanced.metrics.prioritizationEfficiency > existing.metrics.prioritizationEfficiency,
+    enhancedComparableCost < existingComparableCost
+  ].filter(Boolean).length;
+  const complete = benchmarks.filter(row => row.status === 'Complete');
+  const dynamicImproved = complete.filter(row => Number(row.savedMs) > 0).length;
+  const overallImproved = complete.filter(row => getSummaryMedian(row.enhancedOverall) < getSummaryMedian(row.standardOverall)).length;
+  const triggered = dynamic.events.some(event => event.triggered);
+  const sop2Status = !triggered ? 'Not Supported' : dynamic.durationMs < dynamic.standardDurationMs ? 'Supported' : 'Partially Supported';
+  const sop3Status = complete.length && overallImproved === complete.length
+    ? 'Supported'
+    : complete.length && (overallImproved > 0 || dynamicImproved > 0)
+      ? 'Partially Supported'
+      : 'Not Supported';
+  return {
+    objective1: getSupportStatus(sop1Indicators, 3),
+    objective2: sop2Status,
+    objective3: sop3Status
+  };
+}
+
+function renderResearchConclusion(existing, enhanced, dynamic, benchmarks, existingComparableCost, enhancedComparableCost) {
+  const statuses = getObjectiveStatuses(existing, enhanced, dynamic, benchmarks, existingComparableCost, enhancedComparableCost);
+  const complete = benchmarks.filter(row => row.status === 'Complete');
+  const largest = complete[complete.length - 1];
+  const notes = [
+    describeMetricDirection('Allocation accuracy', existing.metrics.allocationAccuracy, enhanced.metrics.allocationAccuracy, formatPercent, true),
+    describeMetricDirection('Prioritization efficiency', existing.metrics.prioritizationEfficiency, enhanced.metrics.prioritizationEfficiency, formatPercent, true),
+    describeMetricDirection('Total physical distance', existing.metrics.totalDistance, enhanced.metrics.totalDistance, value => formatDistanceKm(value), false)
+  ];
+  if (largest) {
+    const overhead = getSummaryMedian(largest.enhancedOverall) - getSummaryMedian(largest.standardOverall);
+    notes.push(overhead > 0
+      ? `At ${largest.size}x${largest.size}, Enhanced overall execution was ${formatDurationMs(overhead)} slower in the median implemented-application benchmark.`
+      : `At ${largest.size}x${largest.size}, Enhanced overall execution was ${formatDurationMs(Math.abs(overhead))} faster in the median implemented-application benchmark.`);
+  }
+  const statusRows = [
+    ['Objective 1', statuses.objective1],
+    ['Objective 2', statuses.objective2],
+    ['Objective 3', statuses.objective3]
+  ];
+  return `<section class="panel compare-section research-status-panel"><div class="panel-head"><div><p class="eyebrow">Chapter 4/5</p><h3>Research Readiness Summary</h3></div></div><div class="research-status-grid">${statusRows.map(([label, status]) => `<article><span>${escapeHtml(label)}</span><strong>${escapeHtml(status)}</strong></article>`).join('')}</div><div class="comparison-note-box">${notes.map(note => `<p>${escapeHtml(note)}</p>`).join('')}<p>Results are measured using the implemented application under controlled and repeated benchmark conditions.</p></div></section>`;
+}
+
+function formatMetricPair(standard, enhanced, formatter = value => value) {
+  return `<strong>Existing:</strong> ${formatter(standard)}<br><strong>Enhanced:</strong> ${formatter(enhanced)}`;
+}
+
+function renderSop3ScalingChart(benchmarks) {
+  const complete = benchmarks.filter(row => row.status === 'Complete');
+  const maxTime = Math.max(...complete.flatMap(row => [getSummaryMedian(row.standardOverall), getSummaryMedian(row.enhancedOverall)]).filter(Number.isFinite), 0);
+  if (!complete.length || !maxTime) return '';
+  const bars = complete.map(row => {
+    const standard = getSummaryMedian(row.standardOverall);
+    const enhanced = getSummaryMedian(row.enhancedOverall);
+    const standardWidth = Math.max(2, (standard / maxTime) * 100);
+    const enhancedWidth = Math.max(2, (enhanced / maxTime) * 100);
+    return `<div class="sop3-chart-row"><span>${row.size}x${row.size}</span><div><i class="standard-bar" style="width:${standardWidth}%"></i><b>${formatDurationMs(standard)}</b></div><div><i class="enhanced-bar" style="width:${enhancedWidth}%"></i><b>${formatDurationMs(enhanced)}</b></div></div>`;
+  }).join('');
+  return `<div class="sop3-scaling-chart"><div class="sop3-chart-head"><strong>Execution Time Scaling</strong><span>Overall median runtime in the implemented application</span></div><div class="sop3-chart-legend"><span><i class="standard-bar"></i>Existing</span><span><i class="enhanced-bar"></i>Enhanced</span></div>${bars}</div>`;
+}
+
+function formatOverheadRatio(existing, enhanced) {
+  const denominator = Number(existing);
+  const numerator = Number(enhanced);
+  if (!Number.isFinite(denominator) || !Number.isFinite(numerator) || denominator <= 0) return 'N/A';
+  return `${(numerator / denominator).toFixed(2)}x`;
+}
+
+function renderSop3RuntimeSummaryTable(benchmarks) {
+  const rows = benchmarks.filter(row => row.status === 'Complete');
+  if (!rows.length) return '';
+  const body = rows.map(row => {
+    const existing = getSummaryMedian(row.standardOverall);
+    const enhanced = getSummaryMedian(row.enhancedOverall);
+    const diff = isFiniteNumber(existing) && isFiniteNumber(enhanced) ? enhanced - existing : null;
+    return `<tr><td>${row.size}x${row.size}</td><td>${formatDurationMs(existing)}</td><td>${formatDurationMs(enhanced)}</td><td>${formatDurationMs(Math.abs(diff))}${diff > 0 ? ' slower' : diff < 0 ? ' faster' : ''}</td><td>${formatOverheadRatio(existing, enhanced)}</td></tr>`;
+  }).join('');
+  return `<div class="table-wrap compare-table-wrap sop3-runtime-summary-wrap"><table class="compare-table sop3-runtime-summary-table"><caption>SOP 3 Runtime Summary</caption><thead><tr><th>Matrix Size</th><th>Existing Median Runtime</th><th>Enhanced Median Runtime</th><th>Absolute Runtime Difference</th><th>Relative Overhead Ratio</th></tr></thead><tbody>${body}</tbody></table></div>`;
+}
+
+function renderPhaseBreakdown(benchmarks, selectedSize = getSelectedComparisonSize()) {
+  const complete = benchmarks.filter(row => row.status === 'Complete');
+  const row = complete.find(item => item.size === selectedSize) || complete[complete.length - 1];
+  if (!row?.phases) return '';
+  const sumPhase = (group, keys) => keys.reduce((total, key) => total + (getSummaryMedian(group?.[key]) || 0), 0);
+  const phaseRows = [
+    {
+      label: 'Preprocessing / normalization time',
+      standardInitial: sumPhase(row.phases.standardInitial, ['preprocessingMs']),
+      enhancedInitial: sumPhase(row.phases.enhancedInitial, ['preprocessingMs']),
+      standardDynamic: sumPhase(row.phases.standardDynamic, ['preprocessingMs', 'criteriaUpdateMs']),
+      enhancedDynamic: sumPhase(row.phases.enhancedDynamic, ['preprocessingMs', 'criteriaUpdateMs'])
+    },
+    {
+      label: 'Cost-matrix construction time',
+      standardInitial: sumPhase(row.phases.standardInitial, ['matrixConstructionMs']),
+      enhancedInitial: sumPhase(row.phases.enhancedInitial, ['matrixConstructionMs']),
+      standardDynamic: sumPhase(row.phases.standardDynamic, ['matrixConstructionMs', 'subproblemBuildMs']),
+      enhancedDynamic: sumPhase(row.phases.enhancedDynamic, ['matrixConstructionMs', 'subproblemBuildMs'])
+    },
+    {
+      label: 'Hungarian optimization time',
+      standardInitial: sumPhase(row.phases.standardInitial, ['hungarianMs']),
+      enhancedInitial: sumPhase(row.phases.enhancedInitial, ['hungarianMs']),
+      standardDynamic: sumPhase(row.phases.standardDynamic, ['hungarianMs']),
+      enhancedDynamic: sumPhase(row.phases.enhancedDynamic, ['hungarianMs'])
+    },
+    {
+      label: 'Dynamic re-assignment time',
+      standardInitial: null,
+      enhancedInitial: null,
+      standardDynamic: getSummaryMedian(row.standardReassignTotal),
+      enhancedDynamic: getSummaryMedian(row.enhancedReassignTotal)
+    },
+    {
+      label: 'UI rendering excluded from research timing',
+      standardInitial: sumPhase(row.phases.standardInitial, ['uiRenderingMs']),
+      enhancedInitial: sumPhase(row.phases.enhancedInitial, ['uiRenderingMs']),
+      standardDynamic: sumPhase(row.phases.standardDynamic, ['uiRenderingMs']),
+      enhancedDynamic: sumPhase(row.phases.enhancedDynamic, ['uiRenderingMs'])
+    }
+  ];
+  const phaseValue = value => value === null ? 'N/A' : formatDurationMs(value);
+  const body = phaseRows.map(item => `<tr><td>${escapeHtml(item.label)}</td><td>${phaseValue(item.standardInitial)}</td><td>${phaseValue(item.enhancedInitial)}</td><td>${phaseValue(item.standardDynamic)}</td><td>${phaseValue(item.enhancedDynamic)}</td></tr>`).join('');
+  return `<details class="technical-details"><summary>View Performance Phase Breakdown (${row.size}x${row.size})</summary><div class="table-wrap compare-table-wrap"><table class="compare-table phase-breakdown-table"><thead><tr><th>Phase</th><th>Existing Initial</th><th>Enhanced Initial</th><th>Existing Dynamic Total</th><th>Enhanced Dynamic Total</th></tr></thead><tbody>${body}</tbody></table></div><p class="compare-note">UI rendering is explicitly excluded from research execution-time measurements.</p></details>`;
+}
+
+function runDynamicPerformanceBenchmarkSample(rows, activeResources, events) {
   const standardInitial = runAssignment('existing', rows, activeResources);
   const enhancedInitial = runAssignment('enhanced', rows, activeResources);
-  const events = createDynamicUrgencyEvents(rows, 5);
-  if (events.length < 5) {
-    return { standardInitial, enhancedInitial, events, status: 'Needs valid urgency values for five dynamic events' };
-  }
   let standardRows = rows.map(row => ({ ...row }));
   let enhancedRows = rows.map(row => ({ ...row }));
   let currentEnhanced = enhancedInitial;
   const standardEventTimes = [];
   const enhancedEventTimes = [];
+  const standardDynamicPhases = {};
+  const enhancedDynamicPhases = {};
   const eventLogs = [];
   events.forEach(event => {
     if (!event.triggered) {
@@ -1581,26 +2009,33 @@ function runDynamicPerformanceBenchmark(rows, activeResources) {
       eventLogs.push({ ...event, standardMs: 0, enhancedMs: 0, changed: false });
       return;
     }
+    const previousAssignment = getResultAssignmentForRow(currentEnhanced, enhancedRows[event.householdIndex]);
     standardRows = applyDynamicEventRows(standardRows, event);
     enhancedRows = applyDynamicEventRows(enhancedRows, event);
     const standardRecomputed = runAssignment('existing', standardRows, activeResources);
     currentEnhanced = selectiveEnhancedReassignment(currentEnhanced, enhancedRows, activeResources, [event.householdIndex]);
+    const updatedAssignment = getResultAssignmentForRow(currentEnhanced, enhancedRows[event.householdIndex]);
     standardEventTimes.push(standardRecomputed.durationMs);
     enhancedEventTimes.push(currentEnhanced.durationMs);
+    addPhaseTimings(standardDynamicPhases, standardRecomputed.phaseTimings);
+    addPhaseTimings(enhancedDynamicPhases, currentEnhanced.phaseTimings);
     eventLogs.push({
       ...event,
       standardMs: standardRecomputed.durationMs,
       enhancedMs: currentEnhanced.durationMs,
-      changed: true
+      changed: previousAssignment?.resourceIndex !== updatedAssignment?.resourceIndex
     });
   });
   const standardReassignTotal = standardEventTimes.reduce((sum, value) => sum + value, 0);
   const enhancedReassignTotal = enhancedEventTimes.reduce((sum, value) => sum + value, 0);
-  const eventCount = events.length;
+  const eventCount = events.filter(event => event.triggered).length || events.length;
   return {
-    status: 'Complete',
-    standardInitial,
-    enhancedInitial,
+    standardInitialMs: standardInitial.durationMs,
+    enhancedInitialMs: enhancedInitial.durationMs,
+    standardInitialPhases: standardInitial.phaseTimings,
+    enhancedInitialPhases: enhancedInitial.phaseTimings,
+    standardDynamicPhases,
+    enhancedDynamicPhases,
     standardReassignTotal,
     enhancedReassignTotal,
     standardAverageReassign: eventCount ? standardReassignTotal / eventCount : null,
@@ -1613,8 +2048,74 @@ function runDynamicPerformanceBenchmark(rows, activeResources) {
   };
 }
 
-function buildBenchmarkRows(rows) {
-  return BENCHMARK_MATRIX_SIZES.map(size => {
+function calculateBreakEvenEvents(standardInitial, enhancedInitial, standardAverageReassign, enhancedAverageReassign) {
+  const initialOverhead = Number(enhancedInitial) - Number(standardInitial);
+  const perEventSaving = Number(standardAverageReassign) - Number(enhancedAverageReassign);
+  if (!Number.isFinite(initialOverhead) || !Number.isFinite(perEventSaving)) return { label: 'N/A', events: null };
+  if (perEventSaving <= 0) return { label: 'N/A', events: null };
+  if (initialOverhead <= 0) return { label: 'Immediate', events: 0 };
+  const events = Math.ceil(initialOverhead / perEventSaving);
+  return { label: `${events} qualifying events`, events };
+}
+
+function runDynamicPerformanceBenchmark(rows, activeResources) {
+  const events = createDynamicUrgencyEvents(rows, 5);
+  if (events.length < 5) return { events, status: 'Needs valid urgency values for five dynamic events' };
+  const standardQuality = runAssignment('existing', rows, activeResources);
+  const enhancedQuality = runAssignment('enhanced', rows, activeResources);
+  for (let index = 0; index < BENCHMARK_WARMUP_RUNS; index++) {
+    runDynamicPerformanceBenchmarkSample(rows, activeResources, events);
+  }
+  const samples = Array.from({ length: BENCHMARK_REPETITIONS }, () => runDynamicPerformanceBenchmarkSample(rows, activeResources, events));
+  const standardInitial = summarizeSamples(samples.map(sample => sample.standardInitialMs));
+  const enhancedInitial = summarizeSamples(samples.map(sample => sample.enhancedInitialMs));
+  const standardAverageReassign = summarizeSamples(samples.map(sample => sample.standardAverageReassign));
+  const enhancedAverageReassign = summarizeSamples(samples.map(sample => sample.enhancedAverageReassign));
+  const standardReassignTotal = summarizeSamples(samples.map(sample => sample.standardReassignTotal));
+  const enhancedReassignTotal = summarizeSamples(samples.map(sample => sample.enhancedReassignTotal));
+  const standardOverall = summarizeSamples(samples.map(sample => sample.standardOverall));
+  const enhancedOverall = summarizeSamples(samples.map(sample => sample.enhancedOverall));
+  const savedMs = getSummaryMedian(standardReassignTotal) - getSummaryMedian(enhancedReassignTotal);
+  const improvementRate = getSummaryMedian(standardReassignTotal) > 0 ? savedMs / getSummaryMedian(standardReassignTotal) : null;
+  const breakEven = calculateBreakEvenEvents(
+    getSummaryMedian(standardInitial),
+    getSummaryMedian(enhancedInitial),
+    getSummaryMedian(standardAverageReassign),
+    getSummaryMedian(enhancedAverageReassign)
+  );
+  return {
+    status: 'Complete',
+    repetitions: BENCHMARK_REPETITIONS,
+    warmups: BENCHMARK_WARMUP_RUNS,
+    standardInitial,
+    enhancedInitial,
+    standardReassignTotal,
+    enhancedReassignTotal,
+    standardAverageReassign,
+    enhancedAverageReassign,
+    standardOverall,
+    enhancedOverall,
+    phases: {
+      standardInitial: summarizePhaseTimings(samples, sample => sample.standardInitialPhases),
+      enhancedInitial: summarizePhaseTimings(samples, sample => sample.enhancedInitialPhases),
+      standardDynamic: summarizePhaseTimings(samples, sample => sample.standardDynamicPhases),
+      enhancedDynamic: summarizePhaseTimings(samples, sample => sample.enhancedDynamicPhases)
+    },
+    savedMs,
+    improvementRate,
+    breakEven,
+    quality: {
+      standard: standardQuality.metrics,
+      enhanced: enhancedQuality.metrics,
+      standardComparableCost: computeComparableWeightedCost(standardQuality, rows, activeResources),
+      enhancedComparableCost: computeComparableWeightedCost(enhancedQuality, rows, activeResources)
+    },
+    events: samples[0]?.events || events
+  };
+}
+
+function buildBenchmarkRows(rows, sizes = [getSelectedComparisonSize()]) {
+  return sizes.map(size => {
     if (rows.length < size) return { size, status: `Needs ${size} verified H*; current H* is ${rows.length}`, standard: null, enhanced: null };
     const benchmarkRows = rows.slice(0, size);
     const benchmarkResources = getActiveResources(benchmarkRows, size);
@@ -1623,12 +2124,29 @@ function buildBenchmarkRows(rows) {
   });
 }
 
-function renderBenchmarkTable(rows) {
-  const benchmarks = buildBenchmarkRows(rows);
-  return `<div class="table-wrap benchmark-wrap"><table class="compare-table benchmark-table"><caption>SOP 3 - Computational Performance Across 5 Dynamic Events</caption><thead><tr><th>Matrix Size</th><th>Initial Time</th><th>Avg Re-Assignment Time</th><th>Total Re-Assignment Time</th><th>Overall Time</th><th>Dynamic Time Saved</th><th>Dynamic Improvement</th></tr></thead><tbody>${benchmarks.map(row => {
-    if (row.status !== 'Complete') return `<tr><td>${row.size}x${row.size}</td><td colspan="6">${escapeHtml(row.status)}</td></tr>`;
-    return `<tr><td>${row.size}x${row.size}</td><td><strong>Existing:</strong> ${formatDurationMs(row.standardInitial.durationMs)}<br><strong>Enhanced:</strong> ${formatDurationMs(row.enhancedInitial.durationMs)}</td><td><strong>Existing:</strong> ${formatDurationMs(row.standardAverageReassign)}<br><strong>Enhanced:</strong> ${formatDurationMs(row.enhancedAverageReassign)}</td><td><strong>Existing:</strong> ${formatDurationMs(row.standardReassignTotal)}<br><strong>Enhanced:</strong> ${formatDurationMs(row.enhancedReassignTotal)}</td><td><strong>Existing:</strong> ${formatDurationMs(row.standardOverall)}<br><strong>Enhanced:</strong> ${formatDurationMs(row.enhancedOverall)}</td><td>${formatDynamicTimeSaved(row.savedMs)}</td><td>${formatDynamicImprovement(row.improvementRate, row.savedMs)}</td></tr>`;
+function renderBenchmarkTable(rows, sizes = [getSelectedComparisonSize()]) {
+  const benchmarks = buildBenchmarkRows(rows, sizes);
+  state.latestBenchmarks = benchmarks;
+  const table = `<div class="table-wrap benchmark-wrap"><table class="compare-table benchmark-table sop3-benchmark-table"><caption>SOP 3 - Computational Performance and Allocation Quality</caption><thead><tr><th>Records Compared</th><th>Mean Allocation Accuracy</th><th>Prioritization Efficiency</th><th>Common Composite Cost</th><th>Initial Time</th><th>Avg Dynamic Time</th><th>Total Dynamic Time</th><th>Overall Time</th><th>Dynamic Saved</th><th>Dynamic Improvement</th></tr></thead><tbody>${benchmarks.map(row => {
+    if (row.status !== 'Complete') return `<tr><td>${row.size}x${row.size}</td><td colspan="9">${escapeHtml(row.status)}</td></tr>`;
+    return `<tr><td>${row.size}x${row.size}<br><small>${row.repetitions} reps after ${row.warmups} warm-ups</small></td><td>${formatMetricPair(row.quality.standard.allocationAccuracy, row.quality.enhanced.allocationAccuracy, formatPercent)}</td><td>${formatMetricPair(row.quality.standard.prioritizationEfficiency, row.quality.enhanced.prioritizationEfficiency, formatPercent)}</td><td>${formatMetricPair(row.quality.standardComparableCost, row.quality.enhancedComparableCost, value => round(value, 3))}</td><td>${formatMetricPair(row.standardInitial, row.enhancedInitial, formatTimingSummary)}</td><td>${formatMetricPair(row.standardAverageReassign, row.enhancedAverageReassign, formatTimingSummary)}</td><td>${formatMetricPair(row.standardReassignTotal, row.enhancedReassignTotal, formatTimingSummary)}</td><td>${formatMetricPair(row.standardOverall, row.enhancedOverall, formatTimingSummary)}</td><td>${formatDynamicTimeSaved(row.savedMs)}</td><td>${formatDynamicImprovement(row.improvementRate, row.savedMs)}</td></tr>`;
   }).join('')}</tbody></table></div>`;
+  return table + renderSop3ScalingChart(benchmarks) + renderSop3RuntimeSummaryTable(benchmarks) + renderPhaseBreakdown(benchmarks) + renderSop3Interpretation(benchmarks);
+}
+
+function renderSop2Summary(dynamic, rows, activeResources, previousCompositeCost, updatedCompositeCost, compositeCostDiff, changedByDynamic) {
+  if (!dynamic.events.length) return '';
+  const triggered = dynamic.status === 'Triggered';
+  const items = [
+    { label: 'Test Events', value: `5 events | ${rows.length}x${activeResources.length}`, note: 'Controlled urgency-change test' },
+    { label: 'Trigger Rule', value: triggered ? 'Triggered' : 'Not triggered', note: 'Delta >= 2' },
+    { label: 'Affected Households', value: dynamic.affectedCount, note: 'Rows updated by urgency change' },
+    { label: 'Existing Method', value: formatDurationMs(dynamic.standardDurationMs), note: triggered ? 'Full distance-only recomputation' : 'No recomputation' },
+    { label: 'Enhanced Method', value: formatDurationMs(dynamic.durationMs), note: triggered ? 'Selective re-optimization with one-to-one constraints' : 'No selective update' },
+    { label: 'Composite Cost', value: `${round(previousCompositeCost, 3)} to ${round(updatedCompositeCost, 3)}`, note: `Change ${formatSignedNumber(compositeCostDiff, 3)}` },
+    { label: 'Assignment Result', value: changedByDynamic ? 'Changed' : 'Same', note: 'A same output is valid when optimum is unchanged' }
+  ];
+  return `<div class="sop2-summary-grid">${items.map(item => `<article><span>${escapeHtml(item.label)}</span><strong>${escapeHtml(String(item.value))}</strong><small>${escapeHtml(item.note)}</small></article>`).join('')}</div>`;
 }
 
 function renderTradeoffSummary(existing, enhanced) {
@@ -1641,90 +2159,68 @@ function renderTradeoffSummary(existing, enhanced) {
   return `<div class="tradeoff-list">${rows.map(row => `<div><span>${escapeHtml(row.label)}</span><strong>${escapeHtml(row.outcome)}</strong><small>${escapeHtml(row.detail)}</small></div>`).join('')}</div>`;
 }
 
-function renderInterpretations(existing, enhanced, changedCount, rows) {
-  const compatibilityDiff = enhanced.metrics.compatibilityRate - existing.metrics.compatibilityRate;
-  const prioritizationDiff = enhanced.metrics.prioritizationEfficiency - existing.metrics.prioritizationEfficiency;
-  const distanceDiff = enhanced.metrics.meanDistance - existing.metrics.meanDistance;
-  const timeDiff = enhanced.durationMs - existing.durationMs;
-  const standardHighUrgencyRate = getHighUrgencyServiceRate(existing);
-  const enhancedHighUrgencyRate = getHighUrgencyServiceRate(enhanced);
-  const highUrgencyDiff = isFiniteNumber(standardHighUrgencyRate) && isFiniteNumber(enhancedHighUrgencyRate)
-    ? enhancedHighUrgencyRate - standardHighUrgencyRate
-    : null;
-  const distanceDirection = isFiniteNumber(distanceDiff) && Math.abs(distanceDiff) > 0.0005
-    ? Number(distanceDiff) > 0 ? `accepted ${formatDistanceKm(Math.abs(distanceDiff))} longer mean physical distance` : `reduced mean physical distance by ${formatDistanceKm(Math.abs(distanceDiff))}`
-    : 'kept mean physical distance unchanged';
-  const urgencyDirection = isFiniteNumber(highUrgencyDiff) && Math.abs(highUrgencyDiff) > 0.0005
-    ? Number(highUrgencyDiff) > 0 ? `improved high-urgency service by ${formatAbsolutePercentagePoint(highUrgencyDiff)}` : `reduced high-urgency service by ${formatAbsolutePercentagePoint(highUrgencyDiff)}`
-    : isFiniteNumber(highUrgencyDiff) ? 'left high-urgency service unchanged' : 'could not evaluate high-urgency service';
-  const compatibilityDirection = isFiniteNumber(compatibilityDiff) && Math.abs(compatibilityDiff) > 0.0005
-    ? Number(compatibilityDiff) > 0 ? `improved compatibility by ${formatAbsolutePercentagePoint(compatibilityDiff)}` : `reduced compatibility by ${formatAbsolutePercentagePoint(compatibilityDiff)}`
-    : 'left compatibility unchanged';
-  const statements = [
-    `Enhanced changed ${changedCount} of ${rows.length} H* assignment decisions (${formatPercent(rows.length ? changedCount / rows.length : null)}).`,
-    `Enhanced changed compatibility from ${formatPercent(existing.metrics.compatibilityRate)} to ${formatPercent(enhanced.metrics.compatibilityRate)}, a change of ${formatPercentagePoint(compatibilityDiff)}.`,
-    `High-urgency households correctly served changed from ${formatHighUrgencyServed(existing)} to ${formatHighUrgencyServed(enhanced)}, a change of ${isFiniteNumber(highUrgencyDiff) ? formatPercentagePoint(highUrgencyDiff) : 'N/A'}.`,
-    `Enhanced changed mean physical distance from ${formatDistanceKm(existing.metrics.meanDistance)} to ${formatDistanceKm(enhanced.metrics.meanDistance)}, a difference of ${formatSignedNumber(distanceDiff, 2, ' km')}.`,
-    `Enhanced changed execution time from ${formatDurationMs(existing.durationMs)} to ${formatDurationMs(enhanced.durationMs)}, a difference of ${formatSignedNumber(timeDiff, 2, ' ms')}.`,
-    isFiniteNumber(existing.metrics.prioritizationEfficiency) && isFiniteNumber(enhanced.metrics.prioritizationEfficiency)
-      ? `Urgency-weighted compatible service changed from ${formatPercent(existing.metrics.prioritizationEfficiency)} to ${formatPercent(enhanced.metrics.prioritizationEfficiency)}, a change of ${formatPercentagePoint(prioritizationDiff)}.`
-      : 'Prioritization efficiency requires urgency values in the current assignments.',
-    `Standard optimizes distance only. Enhanced uses the weighted distance, urgency, and compatibility objective; in this run it ${distanceDirection}, ${urgencyDirection}, and ${compatibilityDirection}.`
-  ];
-  return `<div class="interpretation-list">${statements.map(statement => `<p>${escapeHtml(statement)}</p>`).join('')}<p>Native assignment costs are reported in their own units: Standard uses distance-only kilometers; Enhanced uses composite weighted cost.</p></div>`;
-}
-
 function renderComparisonReport(existing, enhanced, rows, activeResources) {
   const householdRows = buildHouseholdComparisonRows(rows, existing, enhanced);
   const changedCount = householdRows.filter(row => row.changed).length;
   const dynamic = simulateDynamicReassignment(enhanced, rows, activeResources);
-  const highUrgencyExistingRate = getHighUrgencyServiceRate(existing);
-  const highUrgencyEnhancedRate = getHighUrgencyServiceRate(enhanced);
   const existingComparableCost = computeComparableWeightedCost(existing, rows, activeResources);
   const enhancedComparableCost = computeComparableWeightedCost(enhanced, rows, activeResources);
-  const sop1Outcome = formatSop1Outcome(existing, enhanced, existingComparableCost, enhancedComparableCost);
+  const firstDynamicEvent = dynamic.events.find(event => event.triggered) || dynamic.events[0];
+  const lastDynamicEvent = [...dynamic.events].reverse().find(event => event.triggered) || dynamic.events[dynamic.events.length - 1];
+  const dynamicPreviousComposite = firstDynamicEvent?.previousCompositeCost;
+  const dynamicUpdatedComposite = lastDynamicEvent?.updatedCompositeCost;
+  const dynamicCompositeDiff = isFiniteNumber(dynamicPreviousComposite) && isFiniteNumber(dynamicUpdatedComposite)
+    ? dynamicUpdatedComposite - dynamicPreviousComposite
+    : null;
   const sop1Rows = [
     { metric: 'Criteria Used', standard: formatCriterionList(['Distance']), enhanced: formatCriterionList(['Distance', 'Urgency', 'Compatibility']), difference: 'Model design' },
-    { metric: 'Total Assignment Cost', standard: formatNativeCost(existing), enhanced: formatNativeCost(enhanced), difference: 'Not directly comparable', note: 'Native cost: Existing is total distance. Enhanced is composite weighted cost.' },
-    { metric: 'Mean Allocation Accuracy', standard: formatPercent(existing.metrics.allocationAccuracy), enhanced: formatPercent(enhanced.metrics.allocationAccuracy), difference: formatPercentagePoint(enhanced.metrics.allocationAccuracy - existing.metrics.allocationAccuracy), note: 'Mean compatibility score of the final assignments.' },
-    { metric: 'Compatible Assignments', standard: `${existing.metrics.compatibleAssignments} / ${existing.metrics.assignmentCount}`, enhanced: `${enhanced.metrics.compatibleAssignments} / ${enhanced.metrics.assignmentCount}`, difference: formatSignedInteger(enhanced.metrics.compatibleAssignments - existing.metrics.compatibleAssignments), note: 'Post-run evaluation for Existing; optimization criterion for Enhanced.' },
-    { metric: 'High-Urgency Households Served', standard: formatHighUrgencyServed(existing), enhanced: formatHighUrgencyServed(enhanced), difference: isFiniteNumber(highUrgencyExistingRate) && isFiniteNumber(highUrgencyEnhancedRate) ? formatPercentagePoint(highUrgencyEnhancedRate - highUrgencyExistingRate) : 'Not measurable' },
+    { metric: 'Mean Allocation Accuracy (Compatibility Score)', standard: formatPercent(existing.metrics.allocationAccuracy), enhanced: formatPercent(enhanced.metrics.allocationAccuracy), difference: formatPercentagePoint(enhanced.metrics.allocationAccuracy - existing.metrics.allocationAccuracy), note: 'Mean resource-need compatibility score of the final assignments.' },
     { metric: 'Prioritization Efficiency', standard: formatPercent(existing.metrics.prioritizationEfficiency), enhanced: formatPercent(enhanced.metrics.prioritizationEfficiency), difference: formatPrioritizationChange(existing.metrics.prioritizationEfficiency, enhanced.metrics.prioritizationEfficiency), note: 'Urgency-weighted compatibility score of the actual assignment output.' },
     { metric: 'Total Physical Distance', standard: formatDistanceKm(existing.metrics.totalDistance), enhanced: formatDistanceKm(enhanced.metrics.totalDistance), difference: formatSignedNumber(enhanced.metrics.totalDistance - existing.metrics.totalDistance, 2, ' km') },
-    { metric: 'Post-run Composite Cost Evaluation', standard: round(existingComparableCost, 3), enhanced: round(enhancedComparableCost, 3), difference: formatSignedNumber(enhancedComparableCost - existingComparableCost, 3), note: 'Both final solutions are evaluated using the enhanced formula for comparison only.' },
-    { metric: 'Assignments Changed', standard: 'Distance-only output', enhanced: 'Weighted output', difference: formatAssignmentComparisonResult(changedCount, rows.length), note: 'Direct comparison of final household-resource pairings.' }
+    { metric: 'Common Composite Cost Evaluation', standard: round(existingComparableCost, 3), enhanced: round(enhancedComparableCost, 3), difference: formatSignedNumber(enhancedComparableCost - existingComparableCost, 3), note: 'Both final solutions are evaluated using the same proposed weighted cost function for fair comparison. Lower composite cost is better.' },
+    { metric: 'Assignments Changed', standard: 'Distance-only output', enhanced: 'Weighted output', difference: formatAssignmentComparisonResult(changedCount, rows.length), note: 'Descriptive count of changed household-resource pairings; a higher percentage does not automatically mean better performance.' },
+    { metric: 'Native Optimization Objective', standard: formatNativeCost(existing), enhanced: formatNativeCost(enhanced), difference: 'N/A - different objective functions', note: "Native costs are reported in each algorithm's own objective units and are not directly comparable." }
   ];
   const changedByDynamic = dynamic.events.some(event => event.changed);
-  const dynamicRows = dynamic.events.length ? `<tr><td>5 controlled urgency-change events for selected ${rows.length}x${activeResources.length} matrix</td><td>${dynamic.affectedCount}</td><td>${dynamic.status === 'Triggered' ? 'Yes' : 'No'}</td><td>${dynamic.status === 'Triggered' ? 'Full distance-only recomputation for each qualifying event' : 'No recalculation'}</td><td>${dynamic.status === 'Triggered' ? 'Affected assignment subset only for each qualifying event' : 'No selective update'}</td><td>${formatDurationMs(dynamic.standardDurationMs)}</td><td>${formatDurationMs(dynamic.durationMs)}</td><td>${changedByDynamic ? 'Yes' : 'No'}</td></tr>` : '';
-  const dynamicDetailRows = dynamic.events.map(event => `<tr><td>${event.eventNumber}</td><td>${escapeHtml(getHouseholdId(event.household) || event.household.household_id || 'H*')}</td><td>${round(event.previousUrgency, 1)}</td><td>${round(event.newUrgency, 1)}</td><td>${round(event.delta, 1)}</td><td>${formatDurationMs(event.standardMs)}</td><td>${formatDurationMs(event.enhancedMs)}</td><td>${escapeHtml(assignmentLabel(event.previousAssignment))}</td><td>${escapeHtml(assignmentLabel(event.updatedAssignment))}</td><td>${event.changed ? 'Output changed' : 'Same output'}</td></tr>`).join('');
-  const sop2Table = dynamicRows
-    ? `<div class="table-wrap compare-table-wrap"><table class="compare-table"><caption>SOP 2 - Dynamic Re-Assignment Evaluation</caption><thead><tr><th>Event</th><th>Affected Households</th><th>Triggered by Delta &gt;= 2?</th><th>Existing Recalculation Scope</th><th>Enhanced Recalculation Scope</th><th>Existing Time</th><th>Enhanced Time</th><th>Output Changed?</th></tr></thead><tbody>${dynamicRows}</tbody></table></div><p class="compare-note">SOP 2 uses the same deterministic five-event urgency-change test used in SOP 3 for the currently selected matrix size. Timing values are measured live and can vary slightly; changing the matrix size changes which households are included.</p><details class="technical-details"><summary>View Dynamic Event Details</summary><div class="table-wrap compare-table-wrap"><table class="compare-table"><thead><tr><th>Event #</th><th>Household ID</th><th>Previous Urgency</th><th>New Urgency</th><th>Delta</th><th>Existing Time</th><th>Enhanced Time</th><th>Previous Assignment</th><th>Updated Assignment</th><th>Output Result</th></tr></thead><tbody>${dynamicDetailRows}</tbody></table></div></details>`
+  const dynamicDetailRows = dynamic.events.map(event => `<tr><td data-label="Event"><strong class="event-number">${event.eventNumber}</strong></td><td data-label="Household"><strong>${escapeHtml(getHouseholdId(event.household) || event.household.household_id || 'H*')}</strong><small>Urgency ${round(event.previousUrgency, 1)} to ${round(event.newUrgency, 1)} | Delta ${round(event.delta, 1)}</small></td><td data-label="Timing"><div class="sop2-mini-grid"><span>Existing</span><strong>${formatDurationMs(event.standardMs)}</strong><span>Enhanced</span><strong>${formatDurationMs(event.enhancedMs)}</strong></div></td><td data-label="Composite Cost"><div class="sop2-mini-grid"><span>Before</span><strong>${round(event.previousCompositeCost, 3)}</strong><span>After</span><strong>${round(event.updatedCompositeCost, 3)}</strong><span>Change</span><strong>${formatSignedNumber(event.compositeCostDiff, 3)}</strong></div></td><td data-label="Assignment"><div class="sop2-assignment-flow"><span>${escapeHtml(assignmentLabel(event.previousAssignment))}</span><b>to</b><span>${escapeHtml(assignmentLabel(event.updatedAssignment))}</span></div><strong class="${event.changed ? 'changed-yes' : 'changed-no'}">${event.changed ? 'Changed' : 'Same'}</strong></td></tr>`).join('');
+  const sop2Table = dynamic.events.length
+    ? `${renderSop2Summary(dynamic, rows, activeResources, dynamicPreviousComposite, dynamicUpdatedComposite, dynamicCompositeDiff, changedByDynamic)}${renderSop2Interpretation(dynamic)}<p class="compare-note">SOP 2 uses the same deterministic five-event urgency-change test used in SOP 3 for the currently selected matrix size. Timing values are measured live and can vary slightly; changing the matrix size changes which households are included.</p><details class="technical-details sop2-details"><summary>View Dynamic Event Details</summary><div class="table-wrap compare-table-wrap sop2-detail-wrap"><table class="compare-table sop2-detail-table"><thead><tr><th>Event</th><th>Household & Urgency Change</th><th>Run Time</th><th>Composite Cost</th><th>Assignment Result</th></tr></thead><tbody>${dynamicDetailRows}</tbody></table></div></details>`
     : '<div class="notice-panel">SOP 2 is not measurable for this run because the selected dataset has no valid urgency values to update.</div>';
   const assignmentDetails = `<details class="technical-details"><summary>View Household-Level Assignment Comparison</summary>${renderHouseholdComparisonTable(householdRows)}</details>`;
   const technicalDetails = `<details class="technical-details"><summary>View Technical Details</summary><p class="compare-note">Existing distance-only matrix summary: ${escapeHtml(formatMatrixSummary(existing, 'km'))}. Enhanced matrix summary: ${escapeHtml(formatMatrixSummary(enhanced))}. Enhanced weights: distance ${state.weights.distance.toFixed(3)}, urgency ${state.weights.urgency.toFixed(3)}, compatibility ${state.weights.compatibility.toFixed(3)}.</p></details>`;
-  const sop3Table = renderBenchmarkTable(rows);
+  const sop3Table = renderBenchmarkTable(getVerifiedHouseholdSet(), BENCHMARK_MATRIX_SIZES);
+  const researchConclusion = renderResearchConclusion(existing, enhanced, dynamic, state.latestBenchmarks || [], existingComparableCost, enhancedComparableCost);
   state.currentResources = activeResources;
-  $('#compare-content').innerHTML = `<section class="panel compare-section"><div class="panel-head"><div><p class="eyebrow">SOP 1</p><h3>Multi-Criteria Allocation Comparison</h3></div></div>${renderComparisonDataNotes(existing, enhanced, householdRows, rows, activeResources)}<div class="comparison-note-box"><strong>SOP 1 result</strong><p>${escapeHtml(sop1Outcome)}</p><p>Enhanced is expected to improve allocation quality when distance conflicts with urgency or resource compatibility. It is not expected to beat the distance-only baseline on physical distance, because distance is the baseline's only objective.</p></div>${renderComparisonTable(sop1Rows, 'SOP 1 - Multi-Criteria Allocation Comparison')}<p class="compare-note">Existing uses distance only. Enhanced uses the proposed weighted cost matrix: distance + urgency + compatibility. All values are computed from the actual assignment outputs.</p></section><section class="panel compare-section"><div class="panel-head"><div><p class="eyebrow">SOP 2</p><h3>Dynamic Re-Assignment Evaluation</h3></div></div>${sop2Table}</section><section class="panel compare-section"><div class="panel-head"><div><p class="eyebrow">SOP 3</p><h3>Computational Performance</h3></div></div>${sop3Table}<p class="compare-note">SOP 3 separates initial assignment time from dynamic re-assignment time. The enhanced model may cost more at first because it builds a composite matrix, while its computational advantage is evaluated during urgency-change events where Standard performs full recomputation and Enhanced selectively re-optimizes only affected assignments. Dynamic improvement is shown only when Enhanced actually saves measured re-assignment time; otherwise the table reports no improvement or slower execution.</p></section>${assignmentDetails}${technicalDetails}`;
+  $('#compare-content').innerHTML = `<section class="panel compare-section"><div class="panel-head"><div><p class="eyebrow">SOP 1</p><h3>Multi-Criteria Allocation Comparison</h3></div></div>${renderComparisonDataNotes(existing, enhanced, householdRows, rows, activeResources)}${renderComparisonTable(sop1Rows, 'SOP 1 - Multi-Criteria Allocation Comparison')}${renderSop1Interpretation(existing, enhanced, changedCount, rows, existingComparableCost, enhancedComparableCost)}<p class="compare-note">Existing uses distance only. Enhanced uses the proposed weighted cost matrix: distance + urgency + compatibility. Native optimization objectives are shown as context only because they use different units.</p></section><section class="panel compare-section"><div class="panel-head"><div><p class="eyebrow">SOP 2</p><h3>Dynamic Re-Assignment Evaluation</h3></div></div>${sop2Table}</section><section class="panel compare-section"><div class="panel-head"><div><p class="eyebrow">SOP 3</p><h3>Computational Performance</h3></div></div>${sop3Table}<p class="compare-note">SOP 3 separates initial assignment time from dynamic re-assignment time. Results are measured using the implemented application under controlled and repeated benchmark conditions. Both algorithms use identical datasets and test scenarios.</p></section>${researchConclusion}${assignmentDetails}${technicalDetails}`;
   bindComparisonReport(householdRows);
 }
 
 compare = function () {
-  const selectedSize = getSelectedComparisonSize();
-  state.comparisonSize = selectedSize;
-  const blockers = [...getRunBlockers('existing', selectedSize), ...getRunBlockers('enhanced', selectedSize)];
-  if (blockers.length) {
-    toast(blockers[0]);
-      go('compare');
+  if (state.comparing) {
+    toast('Comparison is already running');
     return null;
   }
-  const { households: verifiedHouseholds, resources: activeResources } = getControlledComparisonInputs(selectedSize);
-  const existing = executeShared('existing', verifiedHouseholds, activeResources);
-  const enhanced = executeShared('enhanced', verifiedHouseholds, activeResources);
-  if (!existing || !enhanced) return null;
-  $('#compare-empty').classList.add('hidden');
-  $('#compare-content').classList.remove('hidden');
-  renderComparisonReport(existing, enhanced, verifiedHouseholds, activeResources);
-  return { existing, enhanced };
+  state.comparing = true;
+  const selectedSize = getSelectedComparisonSize();
+  try {
+    state.comparisonSize = selectedSize;
+    const blockers = [...getRunBlockers('existing', selectedSize), ...getRunBlockers('enhanced', selectedSize)];
+    if (blockers.length) {
+      toast(blockers[0]);
+      go('compare');
+      return null;
+    }
+    const { households: verifiedHouseholds, resources: activeResources } = getControlledComparisonInputs(selectedSize);
+    const existing = executeShared('existing', verifiedHouseholds, activeResources);
+    const enhanced = executeShared('enhanced', verifiedHouseholds, activeResources);
+    if (!existing || !enhanced) return null;
+    $('#compare-empty').classList.add('hidden');
+    $('#compare-content').classList.remove('hidden');
+    renderComparisonReport(existing, enhanced, verifiedHouseholds, activeResources);
+    return { existing, enhanced };
+  } finally {
+    state.comparing = false;
+  }
 };
 
 function bind() { document.querySelectorAll('[data-page]').forEach(item => item.addEventListener('click', event => { event.preventDefault(); go(item.dataset.page); })); document.querySelectorAll('[data-page-target]').forEach(item => item.addEventListener('click', () => go(item.dataset.pageTarget))); document.querySelectorAll('[data-run]').forEach(item => item.addEventListener('click', () => { try { if (item.dataset.run === 'both') { if (compare()) go('compare'); } else { if (execute(item.dataset.run)) go(item.dataset.run); } } catch (error) { reportRunError(error); } })); $('#load-demo-data')?.addEventListener('click', () => loadVariedDemoData().catch(error => reportRunError(error, 'Demo load failed'))); $('#file-input')?.addEventListener('change', event => loadFile(event.target.files[0])); $('#resource-file-input')?.addEventListener('change', event => loadResourceFile(event.target.files[0])); $('#comparison-size')?.addEventListener('change', event => { state.comparisonSize = Number(event.target.value); renderDataset(); }); $('#table-search')?.addEventListener('input', renderTable); $('#clear-history')?.addEventListener('click', () => { state.history = []; localStorage.removeItem('allocation-history'); renderHistory(); toast('History cleared'); }); }
@@ -2414,6 +2910,7 @@ function normalizeHouseholdRow(raw, index) {
     geocoding_status: hasProvidedCoordinates ? 'Provided Coordinates' : 'Pending Geocoding',
     geocoding_provider: hasProvidedCoordinates ? 'Uploaded dataset' : '',
     geocoding_display_name: '',
+    source_location_verification_status: locationVerification,
     location_verification_status: locationVerification || 'Pending Location Check',
     location_status: locationVerification || 'Pending Location Check',
     research_area_distance_km: '',
@@ -2511,11 +3008,20 @@ async function resolveHouseholdLocation(row) {
 
 function deriveLocationVerificationStatus(row, location) {
   if (!hasValidCoordinates(row)) return 'Needs Review';
+  if (location?.outside) return 'Outside Research Area';
+  if (isTrustedBarangayLocation(row)) return 'Verified';
   if (row.coordinate_precision === 'Parent Address') return 'Parent Address Match';
   if (row.coordinate_precision && !['provided', 'exact'].includes(String(row.coordinate_precision).toLowerCase())) return 'Needs Review';
   if (location?.review) return 'Needs Review';
-  if (location?.outside) return 'Outside Research Area';
   return 'Verified';
+}
+
+function isUploadedLocationVerified(row) {
+  return String(row?.source_location_verification_status || '').trim().toLowerCase() === 'verified';
+}
+
+function isTrustedBarangayLocation(row) {
+  return isUploadedLocationVerified(row) || String(row?.source_verification_status || '').trim().toLowerCase() === 'verified';
 }
 
 function finalizeGeographyValidation(row) {
@@ -2524,11 +3030,16 @@ function finalizeGeographyValidation(row) {
     location = { status: 'Needs Location Review', inside: false, review: true, outside: false, distanceKm: null, reason: 'Address could not be resolved' };
   } else {
     row.distance_km = geoDistanceKm(RELIEF_HUB.coordinates, [Number(row.latitude), Number(row.longitude)]).toFixed(4);
-    location = row.coordinate_precision === 'Parent Address'
+    location = isTrustedBarangayLocation(row)
+      ? classifyResearchAreaLocation(row)
+      : row.coordinate_precision === 'Parent Address'
       ? { status: 'Needs Location Review', inside: false, review: true, outside: false, distanceKm: getResearchAreaDistanceKm(Number(row.latitude), Number(row.longitude)), reason: 'Geocoding resolved to the parent street address' }
       : row.coordinate_precision && !['provided', 'exact'].includes(String(row.coordinate_precision).toLowerCase())
       ? { status: 'Needs Location Review', inside: false, review: true, outside: false, distanceKm: getResearchAreaDistanceKm(Number(row.latitude), Number(row.longitude)), reason: 'Geocoding resolved only an ambiguous or parent address' }
       : classifyResearchAreaLocation(row);
+    if (isTrustedBarangayLocation(row) && location.review) {
+      location = { ...location, status: 'Inside Research Area', inside: true, review: false, outside: false, reason: '' };
+    }
   }
   row.location_status = location.status;
   row.location_verification_status = deriveLocationVerificationStatus(row, location);
@@ -2605,7 +3116,7 @@ async function validateAndPrepareDataset({ autoRun = false } = {}) {
     if (mappingPanel) mappingPanel.dataset.open = 'true';
     renderColumnMappingPanel();
     renderValidationSummary();
-    toast('Resolve column mapping before validation');
+    toast('Dataset columns could not be auto-detected');
     return;
   }
   state.processing = true;
@@ -2668,10 +3179,13 @@ function getRunBlockers(mode, requestedCount = null) {
     if (!BENCHMARK_MATRIX_SIZES.includes(requestedSize)) blockers.push('Select a supported thesis matrix size');
     if (hstar.length && hstar.length < requestedSize) blockers.push(`At least ${requestedSize} verified H* households are required for a ${requestedSize}x${requestedSize} comparison`);
     if (state.reliefResources.length && state.reliefResources.length < requestedSize) blockers.push(`At least ${requestedSize} available relief resources are required for a ${requestedSize}x${requestedSize} comparison`);
+    const selectedHouseholds = hstar.slice(0, requestedSize);
+    const invalidSelectedHouseholds = selectedHouseholds.filter(row => !hasValidCoordinates(row));
+    if (invalidSelectedHouseholds.length) blockers.push(`${invalidSelectedHouseholds.length} selected household record(s) are missing valid coordinates`);
   }
   if (mode === 'enhanced') {
     const missingUrgency = hstar.filter(row => parseUrgencyValue(row.urgency) === null);
-    if (missingUrgency.length) blockers.push('Enhanced Algorithm cannot run because urgency data is missing or invalid');
+    if (missingUrgency.length) blockers.push('Enhanced method cannot run because urgency data is missing or invalid');
   }
   return blockers;
 }
@@ -2730,27 +3244,8 @@ function renderValidationIssuesTable(rows) {
 function renderColumnMappingPanel() {
   const panel = ensureDatasetPanel('column-mapping-panel', 'mapping-panel');
   if (!panel) return;
-  if (!state.rawRows.length) {
-    panel.classList.add('hidden');
-    return;
-  }
-  state.mappingIssues = getMappingIssues(state.columnMapping);
-  const hasErrors = state.mappingIssues.some(issue => issue.level === 'error');
-  const shouldOpen = hasErrors || panel.dataset.open === 'true';
-  panel.classList.toggle('hidden', !shouldOpen);
-  if (!shouldOpen) return;
-  const issueHtml = state.mappingIssues.length
-    ? `<div class="validation-issues compact">${state.mappingIssues.map(issue => `<span>${escapeHtml(issue.message)}</span>`).join('')}</div>`
-    : '<p class="mapping-note">Columns were mapped confidently. You can still adjust them for a differently structured source file.</p>';
-  const optionHtml = value => ['<option value="">Not mapped</option>', ...state.rawHeaders.map(header => `<option value="${escapeHtml(header)}"${header === value ? ' selected' : ''}>${escapeHtml(header)}</option>`)].join('');
-  panel.innerHTML = `<div class="panel-head"><div><p class="eyebrow">Import Barangay dataset</p><h3>Column mapping</h3></div><button class="small-button" id="validate-mapping" type="button">Validate Dataset</button></div><div class="mapping-grid">${MAPPING_FIELDS.map(field => `<label><span>${escapeHtml(field.label)}${field.required ? ' *' : ''}</span><select data-mapping-key="${field.key}">${optionHtml(state.columnMapping[field.key])}</select></label>`).join('')}</div>${issueHtml}`;
-  panel.querySelectorAll('[data-mapping-key]').forEach(select => {
-    select.addEventListener('change', event => {
-      state.columnMapping[event.target.dataset.mappingKey] = event.target.value;
-      renderColumnMappingPanel();
-    });
-  });
-  panel.querySelector('#validate-mapping').addEventListener('click', () => validateAndPrepareDataset());
+  panel.classList.add('hidden');
+  panel.innerHTML = '';
 }
 
 function renderStagedValidationSummary(panel, summary) {
@@ -2761,20 +3256,15 @@ function renderStagedValidationSummary(panel, summary) {
   const progress = state.processing
     ? 'Processing dataset...'
     : summary
-      ? `${summary.eligibleHouseholds} households are in verified set H* for both Standard and Enhanced algorithms. Borderline and parent-address locations are marked for review instead of rejected.`
-      : 'Map columns, then validate the uploaded dataset.';
+      ? `${summary.eligibleHouseholds} households are in verified set H* for both Standard and Enhanced algorithms.`
+      : 'Validate the uploaded dataset.';
   const importSummary = getImportReadinessSummary();
   const actionHtml = !summary
-    ? `<div class="validation-actions"><button class="primary-button" id="geocode-validate" type="button"${state.processing || importSummary.hasMappingErrors ? ' disabled' : ''}>Geocode & Validate Locations</button><button class="small-button" id="review-mapping" type="button">Review/Fix Column Mapping</button></div>`
-    : `<div class="validation-actions"><button class="small-button" id="review-mapping" type="button">Review/Fix Column Mapping</button></div>`;
+    ? `<div class="validation-actions"><button class="primary-button" id="geocode-validate" type="button"${state.processing || importSummary.hasMappingErrors ? ' disabled' : ''}>Geocode & Validate Locations</button></div>`
+    : '';
   const stagedHtml = !summary ? `<div class="import-readiness"><div><span>✓ detected fields</span><strong>${renderFieldList(importSummary.mappedRequired)}</strong></div><div><span>✓ household count</span><strong>${state.rawRows.length}</strong></div><div><span>✓ vulnerability fields</span><strong>${renderFieldList(importSummary.vulnerabilityColumns)}</strong></div><div><span>⚠ locations requiring geocoding</span><strong>${importSummary.missingLocationRows}</strong></div></div>` : '';
-  panel.innerHTML = `<div class="panel-head"><div><p class="eyebrow">System verification</p><h3>Research readiness</h3></div><span class="live-label">${state.processing ? 'Processing' : summary ? 'Validated' : 'Awaiting validation'}</span></div>${stagedHtml}${actionHtml}<details class="advanced-mapping"><summary>Advanced &gt; Review Column Mapping</summary></details><div class="validation-summary-grid compact-readiness"><div><span>Total Records</span><strong>${summary?.totalRows ?? state.rawRows.length}</strong></div><div><span>Verified H*</span><strong>${summary?.eligibleHouseholds ?? '---'}</strong></div><div><span>Pending/Needs Review</span><strong>${summary?.pendingNeedsReview ?? '---'}</strong></div><div><span>Locations Resolved</span><strong>${summary?.addressesResolved ?? '---'}</strong></div><div><span>Locations Unresolved</span><strong>${summary?.addressesUnresolved ?? '---'}</strong></div></div><p class="validation-progress" id="validation-progress">${escapeHtml(progress)}</p>${issues}`;
+  panel.innerHTML = `<div class="panel-head"><div><p class="eyebrow">System verification</p><h3>Research readiness</h3></div><span class="live-label">${state.processing ? 'Processing' : summary ? 'Validated' : 'Awaiting validation'}</span></div>${stagedHtml}${actionHtml}<div class="validation-summary-grid compact-readiness"><div><span>Total Records</span><strong>${summary?.totalRows ?? state.rawRows.length}</strong></div><div><span>Verified H*</span><strong>${summary?.eligibleHouseholds ?? '---'}</strong></div><div><span>Pending/Needs Review</span><strong>${summary?.pendingNeedsReview ?? '---'}</strong></div><div><span>Locations Resolved</span><strong>${summary?.addressesResolved ?? '---'}</strong></div><div><span>Locations Unresolved</span><strong>${summary?.addressesUnresolved ?? '---'}</strong></div></div><p class="validation-progress" id="validation-progress">${escapeHtml(progress)}</p>${issues}`;
   panel.querySelector('#geocode-validate')?.addEventListener('click', () => validateAndPrepareDataset());
-  panel.querySelector('#review-mapping')?.addEventListener('click', () => {
-    const mappingPanel = $('#column-mapping-panel');
-    if (mappingPanel) mappingPanel.dataset.open = 'true';
-    renderColumnMappingPanel();
-  });
 }
 
 function renderValidationSummary() {
@@ -2819,7 +3309,7 @@ function renderResourceSummary() {
     : '';
   const matrixReadiness = BENCHMARK_MATRIX_SIZES.map(size => `<span class="${hstarCount >= size && state.reliefResources.length >= size ? 'inside-research-area' : 'invalid'}">${size}x${size}</span>`).join('');
   const runActions = hstarCount && state.reliefResources.length
-    ? '<div class="validation-actions"><button class="small-button" type="button" data-ready-run="existing">Run Existing</button><button class="small-button" type="button" data-ready-run="enhanced">Run Enhanced</button><button class="primary-button" type="button" data-ready-run="both">Run Comparison</button></div>'
+    ? '<div class="validation-actions"><button class="small-button" type="button" data-ready-run="existing">Run Standard</button><button class="small-button" type="button" data-ready-run="enhanced">Run Enhanced</button><button class="primary-button" type="button" data-ready-run="both">Compare Both</button></div>'
     : '';
   panel.innerHTML = `<div class="panel-head"><div><p class="eyebrow">Relief resources</p><h3>Resource set R</h3></div><span class="live-label">${escapeHtml(status)}</span></div><div class="validation-summary-grid compact-readiness"><div><span>Raw Households</span><strong>${state.rawRows.length}</strong></div><div><span>Verified H*</span><strong>${hstarCount || '---'}</strong></div><div><span>Total Resources</span><strong>${validation?.totalRows ?? state.resourceRows.length}</strong></div><div><span>Available Resources</span><strong>${state.reliefResources.length}</strong></div><div><span>Matrix</span><strong>${matrixCount ? `${matrixCount} x ${matrixCount}` : '---'}</strong></div><div><span>Source</span><strong>${escapeHtml(state.resourceSource || (state.resourceRows.length ? 'Resources parsed' : 'Required'))}</strong></div><div><span>Invalid Resources</span><strong>${validation?.invalidResources ?? '---'}</strong></div><div><span>Import Status</span><strong>${escapeHtml(importStatus)}</strong></div></div><p class="validation-progress">${state.reliefResources.length ? 'Both algorithms will use this same available resource set R.' : state.resourceRows.length ? 'Resource rows were parsed but none are ready for assignment. Review the errors below.' : 'Relief resource data required before running assignment algorithms.'}</p>${runActions}<div class="matrix-readiness">${matrixReadiness}</div>${mappingIssueHtml}${issues}`;
   panel.querySelectorAll('[data-ready-run]').forEach(button => {
