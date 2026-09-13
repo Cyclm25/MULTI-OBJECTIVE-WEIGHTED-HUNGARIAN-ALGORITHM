@@ -11,7 +11,6 @@ const RESEARCH_WEIGHTS = Object.freeze({ distance: 0.164, urgency: 0.539, compat
 const BENCHMARK_MATRIX_SIZES = Object.freeze([10, 20, 30, 40, 50, 60]);
 const BENCHMARK_WARMUP_RUNS = 3;
 const BENCHMARK_REPETITIONS = 30;
-const SELECTIVE_REASSIGNMENT_CANDIDATE_RESOURCES = 4;
 const HIGH_URGENCY_THRESHOLD = 7;
 const FOUR_POINT_HIGH_URGENCY_THRESHOLD = 3;
 const HUNDRED_POINT_HIGH_URGENCY_THRESHOLD = 70;
@@ -622,6 +621,7 @@ function renderDataset() {
   const rows = state.dataset;
   const keys = getDatasetTableKeys(rows);
   const validation = state.validation;
+  $('.dataset-pill')?.classList.toggle('no-dataset', !rows.length);
   $('#top-dataset').textContent = rows.length ? state.filename : 'No dataset loaded';
   $('#stat-status').textContent = state.processing ? 'Processing' : rows.length ? validation ? 'Ready' : 'Mapping' : 'Waiting';
   $('#stat-file').textContent = rows.length ? validation ? `${validation.eligibleHouseholds} households in verified set H*` : 'Review and validate raw dataset' : 'Upload raw Barangay CSV or XLSX';
@@ -742,16 +742,16 @@ function buildExistingCostMatrix(rows, activeResources) {
 
 function buildEnhancedCostMatrix(rows, activeResources) {
   const started = performance.now();
+  const urgencyScores = rows.map(row => getUrgencyPriorityScore(row, rows));
+  const urgencyPrepared = performance.now();
   const distances = buildDistanceMatrix(rows, activeResources);
-  const urgency = activeResources.map(resource => rows.map(row => {
-    const compatibilityScore = getHouseholdResourceCompatibilityScore(row, resource.resource_type);
-    const suitabilityGap = 1 - (isFiniteNumber(compatibilityScore) ? Number(compatibilityScore) : 0);
-    return getUrgencyPriorityScore(row, rows) * suitabilityGap;
-  }));
+  const distancesEnded = performance.now();
   const compatibility = activeResources.map(resource => rows.map(row => {
     const score = getHouseholdResourceCompatibilityScore(row, resource.resource_type);
     return 1 - (isFiniteNumber(score) ? Number(score) : 0);
   }));
+  const compatibilityEnded = performance.now();
+  const urgency = activeResources.map((_, resourceIndex) => rows.map((__, householdIndex) => urgencyScores[householdIndex] * compatibility[resourceIndex][householdIndex]));
   const criteriaEnded = performance.now();
   const scales = {
     distance: getNormalizationScale(distances.flat()),
@@ -769,13 +769,19 @@ function buildEnhancedCostMatrix(rows, activeResources) {
     const compatibilityComponent = flatCompatibility[index] * RESEARCH_WEIGHTS.compatibility;
     return { distanceComponent, urgencyComponent, compatibilityComponent };
   }));
+  const componentsEnded = performance.now();
   return {
     matrix: components.map(row => row.map(item => item.distanceComponent + item.urgencyComponent + item.compatibilityComponent)),
     components,
     componentScales: scales,
     matrixPhaseTimings: {
-      matrixConstructionMs: (criteriaEnded - started) + (performance.now() - normalizationEnded),
-      normalizationMs: normalizationEnded - criteriaEnded
+      matrixConstructionMs: (criteriaEnded - started) + (componentsEnded - normalizationEnded),
+      distanceCalculationMs: distancesEnded - urgencyPrepared,
+      urgencyPreparationMs: urgencyPrepared - started,
+      urgencyTransformationMs: criteriaEnded - compatibilityEnded,
+      compatibilityCalculationMs: compatibilityEnded - distancesEnded,
+      normalizationMs: normalizationEnded - criteriaEnded,
+      componentAssemblyMs: componentsEnded - normalizationEnded
     },
     criteriaMatrices: {
       distance: distances.map(row => row.slice()),
@@ -848,7 +854,7 @@ function formatNativeCost(result) {
 function formatDurationMs(value) {
   if (!isFiniteNumber(value)) return 'N/A';
   const numeric = Number(value);
-  if (numeric >= 0 && numeric < 0.01) return '<0.01 ms';
+  if (numeric > 0 && numeric < 0.01) return '<0.01 ms';
   return `${numeric.toFixed(2)} ms`;
 }
 
@@ -1025,63 +1031,48 @@ function refreshAssignmentHouseholds(output, rows) {
   });
 }
 
-function getTopResourceIndexesForHousehold(matrix, householdIndex, limit = SELECTIVE_REASSIGNMENT_CANDIDATE_RESOURCES) {
-  return matrix
-    .map((row, resourceIndex) => ({ resourceIndex, value: row?.[householdIndex] }))
-    .filter(item => isFiniteNumber(item.value))
-    .sort((a, b) => Number(a.value) - Number(b.value) || a.resourceIndex - b.resourceIndex)
-    .slice(0, limit)
-    .map(item => item.resourceIndex);
-}
-
-function getTopResourceIndexesForHouseholdFromCriteria(criteriaState, householdIndex, limit = SELECTIVE_REASSIGNMENT_CANDIDATE_RESOURCES) {
-  return criteriaState.criteriaMatrices.distance
-    .map((_, resourceIndex) => ({ resourceIndex, value: getEnhancedEntryFromCriteria(criteriaState.criteriaMatrices, criteriaState.componentScales, resourceIndex, householdIndex).value }))
-    .filter(item => isFiniteNumber(item.value))
-    .sort((a, b) => Number(a.value) - Number(b.value) || a.resourceIndex - b.resourceIndex)
-    .slice(0, limit)
-    .map(item => item.resourceIndex);
-}
-
 function selectiveEnhancedReassignment(currentResult, updatedRows, activeResources, affectedIndexes) {
   const started = performance.now();
   state.currentResources = activeResources;
   const currentOutput = (currentResult?.output || []).map(item => ({ ...item }));
-  const currentMaps = getResultAssignmentMaps(currentResult);
   const prepEnded = performance.now();
   const criteriaState = getUpdatedEnhancedCriteriaState(currentResult, updatedRows, activeResources, affectedIndexes);
   const criteriaEnded = performance.now();
-  const affectedAssignments = affectedIndexes
-    .map(householdIndex => getResultAssignmentForRow(currentResult, updatedRows[householdIndex], currentMaps))
-    .filter(Boolean);
-  const candidateResourceIndexes = new Set(affectedAssignments.map(item => item.resourceIndex).filter(index => typeof index === 'number'));
-  affectedIndexes.forEach(householdIndex => {
-    getTopResourceIndexesForHouseholdFromCriteria(criteriaState, householdIndex).forEach(resourceIndex => candidateResourceIndexes.add(resourceIndex));
-  });
-  const candidateHouseholdIndexes = new Set(affectedIndexes);
-  currentOutput.forEach(item => {
-    if (!candidateResourceIndexes.has(item.resourceIndex)) return;
-    const householdIndex = getOutputHouseholdIndex(item, updatedRows);
-    if (householdIndex >= 0) candidateHouseholdIndexes.add(householdIndex);
-  });
-  const resourceIndexes = [...candidateResourceIndexes].filter(index => typeof index === 'number' && activeResources[index]);
-  const householdIndexes = [...candidateHouseholdIndexes].filter(index => typeof index === 'number' && updatedRows[index]);
-  if (!affectedIndexes.length || !resourceIndexes.length || !householdIndexes.length) {
+  const affectedAssignments = affectedIndexes.filter(householdIndex => updatedRows[householdIndex]);
+  const affectedDiscoveryEnded = performance.now();
+  if (!affectedIndexes.length || !affectedAssignments.length) {
     return { ...currentResult, output: currentOutput, durationMs: performance.now() - started, affectedCount: 0 };
   }
   const selectionEnded = performance.now();
-  const subEntries = resourceIndexes.map(resourceIndex => householdIndexes.map(householdIndex => (
-    getEnhancedEntryFromCriteria(criteriaState.criteriaMatrices, criteriaState.componentScales, resourceIndex, householdIndex)
-  )));
-  const subproblemEnded = performance.now();
-  const subAssignment = hungarian(sanitizeSolverMatrix(subEntries.map(row => row.map(item => item.value))));
+  const previousUrgencyScale = currentResult?.componentScales?.urgency;
+  const updatedUrgencyScale = criteriaState.componentScales.urgency;
+  const urgencyBoundsChanged = !previousUrgencyScale
+    || Number(previousUrgencyScale.min) !== Number(updatedUrgencyScale.min)
+    || Number(previousUrgencyScale.max) !== Number(updatedUrgencyScale.max);
+  const affectedHouseholds = new Set(affectedIndexes);
+  const previousMatrix = currentResult?.costMatrix || [];
+  const fullMatrix = activeResources.map((_, resourceIndex) => updatedRows.map((__, householdIndex) => {
+    const previousValue = previousMatrix?.[resourceIndex]?.[householdIndex];
+    if (!urgencyBoundsChanged && !affectedHouseholds.has(householdIndex) && isFiniteNumber(previousValue)) {
+      return Number(previousValue);
+    }
+    return getEnhancedEntryFromCriteria(criteriaState.criteriaMatrices, criteriaState.componentScales, resourceIndex, householdIndex).value;
+  }));
+  const resourcesExceedHouseholds = activeResources.length > updatedRows.length;
+  const solverSource = resourcesExceedHouseholds
+    ? updatedRows.map((_, householdIndex) => activeResources.map((__, resourceIndex) => fullMatrix[resourceIndex]?.[householdIndex]))
+    : fullMatrix;
+  const solverMatrix = sanitizeSolverMatrix(solverSource);
+  const constraintEnded = performance.now();
+  const assignment = hungarian(solverMatrix);
   const hungarianEnded = performance.now();
-  const outputByResource = new Map(currentOutput.map(item => [item.resourceIndex, item]));
-  subAssignment.forEach((assignedHouseholdPosition, resourcePosition) => {
-    const resourceIndex = resourceIndexes[resourcePosition];
-    const entry = subEntries[resourcePosition][assignedHouseholdPosition];
-    const household = updatedRows[entry.householdIndex];
-    outputByResource.set(resourceIndex, {
+  const algorithmOutput = assignment.map((assignedIndex, index) => {
+    const resourceIndex = resourcesExceedHouseholds ? assignedIndex : index;
+    const householdIndex = resourcesExceedHouseholds ? index : assignedIndex;
+    const household = updatedRows[householdIndex];
+    const entry = getEnhancedEntryFromCriteria(criteriaState.criteriaMatrices, criteriaState.componentScales, resourceIndex, householdIndex);
+    if (!household || !entry) return null;
+    return {
       resource: formatAssignedResource(resourceIndex),
       resourceIndex,
       resourceName: resourceLabel(resourceIndex),
@@ -1091,18 +1082,11 @@ function selectiveEnhancedReassignment(currentResult, updatedRows, activeResourc
       value: entry.value,
       distanceKm: distance(household, resourceIndex),
       components: entry.components
-    });
-  });
-  const algorithmOutput = currentOutput.map(item => outputByResource.get(item.resourceIndex) || item);
+    };
+  }).filter(item => item?.household);
+  const output = refreshAssignmentHouseholds(algorithmOutput, updatedRows);
   const assignmentEnded = performance.now();
   const durationMs = assignmentEnded - started;
-  const output = refreshAssignmentHouseholds(algorithmOutput, updatedRows)
-    .map(item => {
-      const householdIndex = getOutputHouseholdIndex(item, updatedRows);
-      if (householdIndex < 0) return item;
-      const entry = getEnhancedEntryFromCriteria(criteriaState.criteriaMatrices, criteriaState.componentScales, item.resourceIndex, householdIndex);
-      return { ...item, value: entry.value, components: entry.components };
-    });
   const metrics = calculateAssignmentMetrics(output, updatedRows);
   const postEnded = performance.now();
   return {
@@ -1119,10 +1103,14 @@ function selectiveEnhancedReassignment(currentResult, updatedRows, activeResourc
     durationMs,
     phaseTimings: {
       preprocessingMs: prepEnded - started,
+      dataCopyMs: prepEnded - started,
       criteriaUpdateMs: criteriaEnded - prepEnded,
-      candidateSelectionMs: selectionEnded - criteriaEnded,
-      subproblemBuildMs: subproblemEnded - selectionEnded,
-      hungarianMs: hungarianEnded - subproblemEnded,
+      affectedDiscoveryMs: affectedDiscoveryEnded - criteriaEnded,
+      candidateSelectionMs: selectionEnded - affectedDiscoveryEnded,
+      constraintPreparationMs: constraintEnded - selectionEnded,
+      fullMatrixBuildMs: constraintEnded - selectionEnded,
+      hungarianMs: hungarianEnded - constraintEnded,
+      resultMappingMs: assignmentEnded - hungarianEnded,
       assignmentUpdateMs: assignmentEnded - hungarianEnded,
       postProcessingMs: postEnded - assignmentEnded,
       uiRenderingMs: 0
@@ -1130,6 +1118,12 @@ function selectiveEnhancedReassignment(currentResult, updatedRows, activeResourc
     householdOrder: updatedRows.map(row => getHouseholdId(row) || row.household_id || ''),
     componentScales: criteriaState.componentScales,
     criteriaMatrices: criteriaState.criteriaMatrices,
+    normalizationBoundsChanged: urgencyBoundsChanged,
+    matrixRows: activeResources.length,
+    matrixColumns: updatedRows.length,
+    matrixSize: `${activeResources.length}x${updatedRows.length}`,
+    matrixValues: fullMatrix.flat().filter(isFiniteNumber).map(Number),
+    costMatrix: fullMatrix.map(row => row.slice()),
     metrics
   };
 }
@@ -1138,10 +1132,9 @@ function simulateDynamicReassignment(enhanced, rows, activeResources) {
   if (!enhanced || !rows.length) return { status: 'Not Triggered', events: [], affectedCount: 0, durationMs: 0 };
   const events = createDynamicUrgencyEvents(rows, 5);
   if (!events.length) return { status: 'Not Triggered', events: [], affectedCount: 0, durationMs: 0 };
-  let standardRows = rows.map(row => ({ ...row }));
   let enhancedRows = rows.map(row => ({ ...row }));
   let currentEnhanced = enhanced;
-  let standardDurationMs = 0;
+  const standardDurationMs = 0;
   let enhancedDurationMs = 0;
   const eventDetails = events.map(event => {
     const previousAssignment = getResultAssignmentForRow(currentEnhanced, enhancedRows[event.householdIndex]);
@@ -1160,11 +1153,8 @@ function simulateDynamicReassignment(enhanced, rows, activeResources) {
         enhancedMs: 0
       };
     }
-    standardRows = applyDynamicEventRows(standardRows, event);
     enhancedRows = applyDynamicEventRows(enhancedRows, event);
-    const standardRecomputed = runAssignment('existing', standardRows, activeResources);
     currentEnhanced = selectiveEnhancedReassignment(currentEnhanced, enhancedRows, activeResources, [event.householdIndex]);
-    standardDurationMs += standardRecomputed.durationMs;
     enhancedDurationMs += currentEnhanced.durationMs;
     const updatedAssignment = getResultAssignmentForRow(currentEnhanced, enhancedRows[event.householdIndex]);
     const updatedCompositeCost = computeComparableWeightedCost(currentEnhanced, enhancedRows, activeResources);
@@ -1177,7 +1167,7 @@ function simulateDynamicReassignment(enhanced, rows, activeResources) {
       updatedCompositeCost,
       compositeCostDiff: isFiniteNumber(previousCompositeCost) && isFiniteNumber(updatedCompositeCost) ? updatedCompositeCost - previousCompositeCost : null,
       changed: previousAssignment?.resourceIndex !== updatedAssignment?.resourceIndex,
-      standardMs: standardRecomputed.durationMs,
+      standardMs: 0,
       enhancedMs: currentEnhanced.durationMs
     };
   });
@@ -1207,6 +1197,60 @@ function getResultAssignmentMaps(result) {
 function getResultAssignmentForRow(result, row, maps = getResultAssignmentMaps(result)) {
   const id = getHouseholdId(row);
   return maps.byRow.get(row) || (id ? maps.byId.get(id) : null);
+}
+
+function getAssignmentPairKey(item) {
+  const householdId = getHouseholdId(item?.household) || item?.householdIndex;
+  return `${householdId}=>${item?.resourceIndex}`;
+}
+
+function validateOneToOneAssignment(result) {
+  const output = result?.output || [];
+  const resources = new Set();
+  const households = new Set();
+  output.forEach(item => {
+    resources.add(item.resourceIndex);
+    households.add(getHouseholdId(item.household) || item.householdIndex);
+  });
+  return output.length > 0 && resources.size === output.length && households.size === output.length;
+}
+
+function compareAssignmentOutputs(referenceResult, candidateResult) {
+  const referencePairs = new Set((referenceResult?.output || []).map(getAssignmentPairKey));
+  const candidatePairs = new Set((candidateResult?.output || []).map(getAssignmentPairKey));
+  const agreement = [...referencePairs].filter(pair => candidatePairs.has(pair)).length;
+  const total = Math.max(referencePairs.size, candidatePairs.size);
+  return {
+    agreement,
+    total,
+    agreementRate: total ? agreement / total : null,
+    fullOneToOne: validateOneToOneAssignment(referenceResult),
+    selectiveOneToOne: validateOneToOneAssignment(candidateResult)
+  };
+}
+
+function buildSelectiveValidation(fullResult, selectiveResult) {
+  const fullCost = Number(fullResult?.cost);
+  const selectiveCost = Number(selectiveResult?.cost);
+  const costDiff = Number.isFinite(fullCost) && Number.isFinite(selectiveCost) ? selectiveCost - fullCost : null;
+  const absCostDiff = Number.isFinite(costDiff) ? Math.abs(costDiff) : null;
+  const assignment = compareAssignmentOutputs(fullResult, selectiveResult);
+  const tolerance = 1e-6;
+  let status = 'Not measurable';
+  if (Number.isFinite(absCostDiff)) {
+    if (absCostDiff <= tolerance) status = 'Equivalent result';
+    else if (costDiff > tolerance) status = 'Differs; selective is above full optimum';
+    else status = 'Differs; selective is below full recompute cost, review objective state';
+  }
+  return {
+    fullCost,
+    selectiveCost,
+    costDiff,
+    absCostDiff,
+    ...assignment,
+    globallyOptimal: Number.isFinite(absCostDiff) ? absCostDiff <= tolerance : false,
+    status
+  };
 }
 
 function averageRanks(values) {
@@ -1445,13 +1489,13 @@ function renderResult(result) {
     return `<div class="result-row"><span>${item.resource} <b>→</b> ${item.household.household_id}</span><small>${summary}</small></div>`;
   }).join('');
   if (result.mode === 'existing') {
-    $(metrics).innerHTML = `<div class="metric-section-title"><span>Optimization criterion</span><strong>Distance only</strong></div><div><span>Total distance cost</span><strong>${result.cost.toFixed(2)} km</strong></div><div><span>Mean assignment distance</span><strong>${result.meanDistance.toFixed(2)} km</strong></div><div><span>Maximum assignment distance</span><strong>${result.maxDistance.toFixed(2)} km</strong></div><div><span>Number of assignments</span><strong>${result.output.length}</strong></div><div><span>Execution time</span><strong>${result.duration} ms</strong></div><div class="metric-section-note"><span>Evaluation metrics only</span><small>Compatibility and priority are measured after assignment; they do not affect the Standard Hungarian result.</small></div><div><span>Compatibility rate</span><strong>${(result.accuracy * 100).toFixed(1)}%</strong></div><div><span>Prioritization efficiency</span><strong>${(result.prioritization * 100).toFixed(1)}%</strong></div>`;
+    $(metrics).innerHTML = `<div class="metric-section-title"><span>Optimization criterion</span><strong>Distance only</strong></div><div><span>Total distance cost</span><strong>${result.cost.toFixed(2)} km</strong></div><div><span>Mean assignment distance</span><strong>${result.meanDistance.toFixed(2)} km</strong></div><div><span>Maximum assignment distance</span><strong>${result.maxDistance.toFixed(2)} km</strong></div><div><span>Number of assignments</span><strong>${result.output.length}</strong></div><div><span>Execution time</span><strong>${formatDurationMs(result.durationMs)}</strong></div><div class="metric-section-note"><span>Evaluation metrics only</span><small>Compatibility and priority are measured after assignment; they do not affect the Standard Hungarian result.</small></div><div><span>Compatibility rate</span><strong>${(result.accuracy * 100).toFixed(1)}%</strong></div><div><span>Prioritization efficiency</span><strong>${(result.prioritization * 100).toFixed(1)}%</strong></div>`;
   } else {
-    $(metrics).innerHTML = `<div><span>Total weighted cost</span><strong>${result.cost.toFixed(2)}</strong></div><div><span>Total assignment distance</span><strong>${result.totalDistance.toFixed(2)} km</strong></div><div><span>Compatibility rate</span><strong>${(result.accuracy * 100).toFixed(1)}%</strong></div><div><span>Prioritization efficiency</span><strong>${(result.prioritization * 100).toFixed(1)}%</strong></div><div><span>Execution time</span><strong>${result.duration} ms</strong></div>`;
+    $(metrics).innerHTML = `<div><span>Total weighted cost</span><strong>${result.cost.toFixed(2)}</strong></div><div><span>Total assignment distance</span><strong>${result.totalDistance.toFixed(2)} km</strong></div><div><span>Compatibility rate</span><strong>${(result.accuracy * 100).toFixed(1)}%</strong></div><div><span>Prioritization efficiency</span><strong>${(result.prioritization * 100).toFixed(1)}%</strong></div><div><span>Execution time</span><strong>${formatDurationMs(result.durationMs)}</strong></div>`;
   }
   $(`#${result.mode}-status`).textContent = 'Complete';
   $('#stat-latest').textContent = result.mode === 'existing' ? 'Baseline' : 'Enhanced';
-  $('#stat-latest-detail').textContent = `${result.duration} ms · ${result.records} verified records`;
+  $('#stat-latest-detail').textContent = `${formatDurationMs(result.durationMs)} · ${result.records} verified records`;
   $('#dashboard-output').className = 'result-list';
   $('#dashboard-output').innerHTML = result.output.slice(0, 5).map(item => `<div class="result-row"><span>${item.resource} <b>→</b> ${item.household.household_id}</span><small>${item.value.toFixed(2)}</small></div>`).join('');
 }
@@ -1478,7 +1522,15 @@ function compare() {
   draw(existing, '#compare-existing');
   draw(enhanced, '#compare-enhanced-list');
 }
-function renderHistory() { $('#history-list').innerHTML = state.history.length ? state.history.map(run => `<div class="history-row"><span>${run.id}</span><span>${run.mode === 'existing' ? 'Existing' : 'Enhanced'}</span><span>${run.dataset}</span><span>${run.records}</span><span>${run.duration} ms</span><span>Complete</span></div>`).join('') : '<div class="empty-output"><span>↺</span><p>No runs recorded yet.</p></div>'; }
+function renderHistory() {
+  $('#history-list').innerHTML = state.history.length
+    ? state.history.map(run => {
+      const duration = Number(run.duration);
+      const durationText = duration === 0 ? '<0.01 ms' : formatDurationMs(duration);
+      return `<div class="history-row"><span>${run.id}</span><span>${run.mode === 'existing' ? 'Existing' : 'Enhanced'}</span><span>${run.dataset}</span><span>${run.records}</span><span>${durationText}</span><span>Complete</span></div>`;
+    }).join('')
+    : '<div class="empty-output"><span>↺</span><p>No runs recorded yet.</p></div>';
+}
 renderResult = function (result) {
   const target = result.mode === 'existing' ? '#existing-output' : '#enhanced-output';
   const metrics = result.mode === 'existing' ? '#existing-metrics' : '#enhanced-metrics';
@@ -1599,13 +1651,13 @@ function formatDynamicTimeSaved(value) {
   const numeric = Number(value);
   if (Math.abs(numeric) < 0.005) return 'No measurable saving';
   return numeric > 0
-    ? `${numeric.toFixed(2)} ms saved`
-    : `${Math.abs(numeric).toFixed(2)} ms slower`;
+    ? `${formatDurationMs(numeric)} saved`
+    : `${formatDurationMs(Math.abs(numeric))} slower`;
 }
 
 function formatDynamicImprovement(value, savedMs) {
   if (!isFiniteNumber(value) || !isFiniteNumber(savedMs)) return 'Not mathematically valid';
-  if (Number(savedMs) <= 0) return 'No improvement';
+  if (Number(savedMs) <= 0) return 'No positive reduction';
   return formatPercent(value);
 }
 
@@ -1621,12 +1673,12 @@ function describeMetricDirection(label, standard, enhanced, formatter, higherIsB
 
 function renderSop1Interpretation(existing, enhanced, changedCount, rows, existingComparableCost, enhancedComparableCost) {
   const statements = [
-    describeMetricDirection('Mean allocation accuracy', existing.metrics.allocationAccuracy, enhanced.metrics.allocationAccuracy, formatPercent, true),
+    describeMetricDirection('Mean resource-need compatibility score', existing.metrics.allocationAccuracy, enhanced.metrics.allocationAccuracy, formatPercent, true),
     describeMetricDirection('Prioritization efficiency', existing.metrics.prioritizationEfficiency, enhanced.metrics.prioritizationEfficiency, formatPercent, true),
     'High-urgency compatible assignment rate is marked as threshold not defined because Chapter 1-3 does not formalize a high-urgency cutoff.',
     describeMetricDirection('Total physical distance', existing.metrics.totalDistance, enhanced.metrics.totalDistance, value => formatDistanceKm(value), false),
     describeMetricDirection('Common composite cost', existingComparableCost, enhancedComparableCost, value => round(value, 3), false),
-    `Assignments changed: ${formatAssignmentComparisonResult(changedCount, rows.length)}.`
+    `Assignments changed: ${formatAssignmentComparisonResult(changedCount, rows.length)}. This is descriptive only, not an improvement measure.`
   ];
   return `<details class="comparison-note-box sop-interpretation"><summary>SOP 1 interpretation</summary>${statements.map(statement => `<p>${escapeHtml(statement)}</p>`).join('')}</details>`;
 }
@@ -1791,7 +1843,7 @@ function addPhaseTimings(target, source) {
 }
 
 function summarizePhaseTimings(samples, selector) {
-  const keys = ['preprocessingMs', 'matrixConstructionMs', 'criteriaUpdateMs', 'candidateSelectionMs', 'subproblemBuildMs', 'hungarianMs', 'assignmentOutputMs', 'assignmentUpdateMs', 'postProcessingMs', 'uiRenderingMs'];
+  const keys = ['preprocessingMs', 'matrixConstructionMs', 'distanceCalculationMs', 'urgencyPreparationMs', 'urgencyTransformationMs', 'compatibilityCalculationMs', 'normalizationMs', 'componentAssemblyMs', 'dataCopyMs', 'criteriaUpdateMs', 'affectedDiscoveryMs', 'candidateSelectionMs', 'constraintPreparationMs', 'fullMatrixBuildMs', 'hungarianMs', 'assignmentOutputMs', 'resultMappingMs', 'assignmentUpdateMs', 'postProcessingMs', 'uiRenderingMs'];
   return Object.fromEntries(keys.map(key => [key, summarizeSamples(samples.map(sample => selector(sample)?.[key]))]));
 }
 
@@ -1804,37 +1856,91 @@ function getSummaryMedian(summary) {
   return isFiniteNumber(summary?.median) ? Number(summary.median) : null;
 }
 
+function formatMedianDuration(summary) {
+  return formatDurationMs(getSummaryMedian(summary));
+}
+
+function formatDefenseDuration(value) {
+  if (!isFiniteNumber(value)) return 'N/A';
+  const numeric = Number(value);
+  if (numeric > 0 && numeric < 0.01) return '<0.01 ms';
+  return `${numeric.toFixed(2)} ms`;
+}
+
+function formatMedianDefenseDuration(summary) {
+  return formatDefenseDuration(getSummaryMedian(summary));
+}
+
+function formatDefenseTimeSaved(value) {
+  if (!isFiniteNumber(value)) return 'N/A';
+  const numeric = Number(value);
+  if (Math.abs(numeric) < 0.005) return 'No measurable saving';
+  return numeric > 0 ? formatDefenseDuration(numeric) : `${formatDefenseDuration(Math.abs(numeric))} slower`;
+}
+
+function formatCompactPercent(value) {
+  return formatPercent(value, 1);
+}
+
+function renderSop3AInterpretation(benchmarks) {
+  const complete = benchmarks.filter(row => row.status === 'Complete');
+  const row = complete[complete.length - 1];
+  if (!row) return '';
+  const standardInitial = getSummaryMedian(row.standardInitial);
+  const enhancedInitial = getSummaryMedian(row.enhancedInitial);
+  const compatibilityDiff = row.quality.enhanced.allocationAccuracy - row.quality.standard.allocationAccuracy;
+  const priorityDiff = row.quality.enhanced.prioritizationEfficiency - row.quality.standard.prioritizationEfficiency;
+  const qualityParts = [];
+  if (isFiniteNumber(compatibilityDiff)) qualityParts.push(compatibilityDiff >= 0 ? 'higher compatibility' : 'lower compatibility');
+  if (isFiniteNumber(priorityDiff)) qualityParts.push(priorityDiff >= 0 ? 'higher prioritization efficiency' : 'lower prioritization efficiency');
+  const runtime = enhancedInitial > standardInitial
+    ? `required more initial computation than Standard (${formatDurationMs(enhancedInitial)} vs ${formatDurationMs(standardInitial)} at ${row.size}x${row.size})`
+    : `required less initial computation than Standard (${formatDurationMs(enhancedInitial)} vs ${formatDurationMs(standardInitial)} at ${row.size}x${row.size})`;
+  const quality = qualityParts.length ? `showed ${qualityParts.join(' and ')}` : 'reported comparable allocation-quality indicators';
+  return `<p class="compare-note sop3-defense-note">SOP 3A: Enhanced ${quality} and ${runtime}.</p>`;
+}
+
+function renderSop3BInterpretation(benchmarks) {
+  const complete = benchmarks.filter(row => row.status === 'Complete');
+  const row = complete[complete.length - 1];
+  if (!row) return '';
+  const full = getSummaryMedian(row.enhancedFullReassignTotal);
+  const selective = getSummaryMedian(row.enhancedSelectiveReassignTotal);
+  const diff = full - selective;
+  const statement = diff > 0
+    ? `Selective updating reduced repeated dynamic re-assignment time compared with complete Enhanced recomputation (${formatDurationMs(selective)} vs ${formatDurationMs(full)} across five events at ${row.size}x${row.size}).`
+    : diff < 0
+      ? `Selective updating took longer than complete Enhanced recomputation in this run (${formatDurationMs(selective)} vs ${formatDurationMs(full)} across five events at ${row.size}x${row.size}).`
+      : `Selective updating and complete Enhanced recomputation tied across five events at ${row.size}x${row.size}.`;
+  return `<p class="compare-note sop3-defense-note">SOP 3B: ${statement}</p>`;
+}
+
 function renderSop3Interpretation(benchmarks) {
   const complete = benchmarks.filter(row => row.status === 'Complete');
   const row = complete[complete.length - 1];
   if (!row) return '';
   const standardInitial = getSummaryMedian(row.standardInitial);
   const enhancedInitial = getSummaryMedian(row.enhancedInitial);
-  const standardOverall = getSummaryMedian(row.standardOverall);
-  const enhancedOverall = getSummaryMedian(row.enhancedOverall);
+  const enhancedFullDynamic = getSummaryMedian(row.enhancedFullReassignTotal);
+  const enhancedSelectiveDynamic = getSummaryMedian(row.enhancedSelectiveReassignTotal);
   const initialDiff = enhancedInitial - standardInitial;
-  const overallDiff = enhancedOverall - standardOverall;
-  const practicalLimitMs = 1000;
+  const dynamicDiff = enhancedFullDynamic - enhancedSelectiveDynamic;
   const statements = [];
   if (isFiniteNumber(initialDiff)) {
     if (initialDiff > 0) statements.push(`At ${row.size}x${row.size}, Enhanced initial assignment added ${formatDurationMs(initialDiff)} of computational overhead because it evaluates distance, urgency, and compatibility.`);
     else if (initialDiff < 0) statements.push(`At ${row.size}x${row.size}, Enhanced initial assignment was ${formatDurationMs(Math.abs(initialDiff))} faster in the median run.`);
     else statements.push(`At ${row.size}x${row.size}, both algorithms had the same median initial assignment time.`);
   }
-  if (isFiniteNumber(row.savedMs)) {
-    if (row.savedMs > 0) statements.push(`Dynamic re-assignment saved ${formatDurationMs(row.savedMs)} across the five qualifying events.`);
-    else if (row.savedMs < 0) statements.push(`Dynamic re-assignment was ${formatDurationMs(Math.abs(row.savedMs))} slower for Enhanced across the five qualifying events.`);
-    else statements.push('Dynamic re-assignment time was tied across the five qualifying events.');
+  if (isFiniteNumber(dynamicDiff)) {
+    if (dynamicDiff > 0) statements.push(`Enhanced selective dynamic update saved ${formatDurationMs(dynamicDiff)} versus Enhanced full recompute across the five qualifying urgency-change events.`);
+    else if (dynamicDiff < 0) statements.push(`Enhanced selective dynamic update was ${formatDurationMs(Math.abs(dynamicDiff))} slower than Enhanced full recompute across the five qualifying urgency-change events.`);
+    else statements.push('Enhanced full recompute and Enhanced selective dynamic update were tied across the five qualifying events.');
   }
-  if (isFiniteNumber(overallDiff)) {
-    if (overallDiff > 0) {
-      statements.push(`Overall execution was ${formatDurationMs(overallDiff)} slower for Enhanced after five events. Existing is faster in this measurement because it optimizes only distance.`);
-    }
-    else if (overallDiff < 0) statements.push(`Overall execution was ${formatDurationMs(Math.abs(overallDiff))} faster for Enhanced after five events.`);
-    else statements.push('Overall execution time was tied after five events.');
+  if (initialDiff > 0 && dynamicDiff > 0) {
+    statements.push('The observed result is a trade-off: Enhanced requires greater initial computation, primarily for multi-objective cost-matrix construction, while selective updating reduces repeated urgency-change re-assignment time compared with complete Enhanced recomputation.');
   }
-  if (row.savedMs > 0 && row.breakEven?.events !== null) statements.push(`Break-even estimate: ${row.breakEven?.label || 'N/A'}.`);
-  if (isFiniteNumber(enhancedOverall) && enhancedOverall < practicalLimitMs) statements.push(`Enhanced remained within practical millisecond-level runtime for the tested ${row.size}x${row.size} matrix, but this is not a computational speed advantage over Existing.`);
+  statements.push('Standard is not used as an urgency-change dynamic baseline because urgency is not part of its distance-only cost matrix.');
+  statements.push('These timings must not be combined into a single claim that Enhanced is faster; initial assignment runtime and Enhanced dynamic-update efficiency answer different questions.');
   return `<details class="comparison-note-box sop-interpretation"><summary>SOP 3 timing interpretation</summary>${statements.map(statement => `<p>${escapeHtml(statement)}</p>`).join('')}</details>`;
 }
 
@@ -1843,86 +1949,31 @@ function renderSop2Interpretation(dynamic) {
   const statements = [];
   const triggeredCount = dynamic.events.filter(event => event.triggered).length;
   statements.push(`${triggeredCount} of ${dynamic.events.length} controlled urgency-change events met the Delta >= 2 trigger rule.`);
-  const diff = dynamic.durationMs - dynamic.standardDurationMs;
-  if (isFiniteNumber(diff)) {
-    if (diff > 0) statements.push(`Enhanced selective re-assignment was ${formatDurationMs(diff)} slower than Existing full recomputation in this application-runtime measurement.`);
-    else if (diff < 0) statements.push(`Enhanced selective re-assignment was ${formatDurationMs(Math.abs(diff))} faster than Existing full recomputation in this application-runtime measurement.`);
-    else statements.push('Enhanced and Existing dynamic re-assignment time were tied in this application-runtime measurement.');
-  }
+  statements.push('Standard is non-responsive to urgency changes because urgency is not part of its distance-only objective.');
+  if (isFiniteNumber(dynamic.durationMs)) statements.push(`Enhanced selective matrix update plus full Hungarian re-assignment took ${formatDurationMs(dynamic.durationMs)} across triggered events in this application-runtime measurement.`);
+  statements.push('Composite cost changes are interpreted against the newly updated objective matrix; a positive cost difference after an urgency change is not automatically an error.');
   statements.push(dynamic.events.some(event => event.changed)
     ? 'At least one event changed the final household-resource pairing after recomputation.'
     : 'The final assignment remained the same after recomputation; this is valid when the checked optimum is unchanged.');
   return `<details class="comparison-note-box sop-interpretation"><summary>SOP 2 interpretation</summary>${statements.map(statement => `<p>${escapeHtml(statement)}</p>`).join('')}</details>`;
 }
 
-function getSupportStatus(score, possible) {
-  if (!possible) return 'Not Supported';
-  if (score >= possible) return 'Supported';
-  return score > 0 ? 'Partially Supported' : 'Not Supported';
-}
-
-function getObjectiveStatuses(existing, enhanced, dynamic, benchmarks, existingComparableCost, enhancedComparableCost) {
-  const sop1Indicators = [
-    enhanced.metrics.allocationAccuracy > existing.metrics.allocationAccuracy,
-    enhanced.metrics.prioritizationEfficiency > existing.metrics.prioritizationEfficiency,
-    enhancedComparableCost < existingComparableCost
-  ].filter(Boolean).length;
-  const complete = benchmarks.filter(row => row.status === 'Complete');
-  const dynamicImproved = complete.filter(row => Number(row.savedMs) > 0).length;
-  const overallImproved = complete.filter(row => getSummaryMedian(row.enhancedOverall) < getSummaryMedian(row.standardOverall)).length;
-  const triggered = dynamic.events.some(event => event.triggered);
-  const sop2Status = !triggered ? 'Not Supported' : dynamic.durationMs < dynamic.standardDurationMs ? 'Supported' : 'Partially Supported';
-  const sop3Status = complete.length && overallImproved === complete.length
-    ? 'Supported'
-    : complete.length && (overallImproved > 0 || dynamicImproved > 0)
-      ? 'Partially Supported'
-      : 'Not Supported';
-  return {
-    objective1: getSupportStatus(sop1Indicators, 3),
-    objective2: sop2Status,
-    objective3: sop3Status
-  };
-}
-
-function renderResearchConclusion(existing, enhanced, dynamic, benchmarks, existingComparableCost, enhancedComparableCost) {
-  const statuses = getObjectiveStatuses(existing, enhanced, dynamic, benchmarks, existingComparableCost, enhancedComparableCost);
-  const complete = benchmarks.filter(row => row.status === 'Complete');
-  const largest = complete[complete.length - 1];
-  const notes = [
-    describeMetricDirection('Allocation accuracy', existing.metrics.allocationAccuracy, enhanced.metrics.allocationAccuracy, formatPercent, true),
-    describeMetricDirection('Prioritization efficiency', existing.metrics.prioritizationEfficiency, enhanced.metrics.prioritizationEfficiency, formatPercent, true),
-    describeMetricDirection('Total physical distance', existing.metrics.totalDistance, enhanced.metrics.totalDistance, value => formatDistanceKm(value), false)
-  ];
-  if (largest) {
-    const overhead = getSummaryMedian(largest.enhancedOverall) - getSummaryMedian(largest.standardOverall);
-    notes.push(overhead > 0
-      ? `At ${largest.size}x${largest.size}, Enhanced overall execution was ${formatDurationMs(overhead)} slower in the median implemented-application benchmark.`
-      : `At ${largest.size}x${largest.size}, Enhanced overall execution was ${formatDurationMs(Math.abs(overhead))} faster in the median implemented-application benchmark.`);
-  }
-  const statusRows = [
-    ['Objective 1', statuses.objective1],
-    ['Objective 2', statuses.objective2],
-    ['Objective 3', statuses.objective3]
-  ];
-  return `<section class="panel compare-section research-status-panel"><div class="panel-head"><div><p class="eyebrow">Chapter 4/5</p><h3>Research Readiness Summary</h3></div></div><div class="research-status-grid">${statusRows.map(([label, status]) => `<article><span>${escapeHtml(label)}</span><strong>${escapeHtml(status)}</strong></article>`).join('')}</div><div class="comparison-note-box">${notes.map(note => `<p>${escapeHtml(note)}</p>`).join('')}<p>Results are measured using the implemented application under controlled and repeated benchmark conditions.</p></div></section>`;
-}
-
 function formatMetricPair(standard, enhanced, formatter = value => value) {
-  return `<strong>Existing:</strong> ${formatter(standard)}<br><strong>Enhanced:</strong> ${formatter(enhanced)}`;
+  return `<strong>Standard:</strong> ${formatter(standard)}<br><strong>Enhanced:</strong> ${formatter(enhanced)}`;
 }
 
 function renderSop3ScalingChart(benchmarks) {
   const complete = benchmarks.filter(row => row.status === 'Complete');
-  const maxTime = Math.max(...complete.flatMap(row => [getSummaryMedian(row.standardOverall), getSummaryMedian(row.enhancedOverall)]).filter(Number.isFinite), 0);
+  const maxTime = Math.max(...complete.flatMap(row => [getSummaryMedian(row.standardInitial), getSummaryMedian(row.enhancedInitial)]).filter(Number.isFinite), 0);
   if (!complete.length || !maxTime) return '';
   const bars = complete.map(row => {
-    const standard = getSummaryMedian(row.standardOverall);
-    const enhanced = getSummaryMedian(row.enhancedOverall);
+    const standard = getSummaryMedian(row.standardInitial);
+    const enhanced = getSummaryMedian(row.enhancedInitial);
     const standardWidth = Math.max(2, (standard / maxTime) * 100);
     const enhancedWidth = Math.max(2, (enhanced / maxTime) * 100);
-    return `<div class="sop3-chart-row"><span>${row.size}x${row.size}</span><div><i class="standard-bar" style="width:${standardWidth}%"></i><b>${formatDurationMs(standard)}</b></div><div><i class="enhanced-bar" style="width:${enhancedWidth}%"></i><b>${formatDurationMs(enhanced)}</b></div></div>`;
+    return `<div class="sop3-chart-row"><span>${row.size}x${row.size}</span><div><i class="standard-bar" style="width:${standardWidth}%"></i><b>${formatDefenseDuration(standard)}</b></div><div><i class="enhanced-bar" style="width:${enhancedWidth}%"></i><b>${formatDefenseDuration(enhanced)}</b></div></div>`;
   }).join('');
-  return `<div class="sop3-scaling-chart"><div class="sop3-chart-head"><strong>Execution Time Scaling</strong><span>Overall median runtime in the implemented application</span></div><div class="sop3-chart-legend"><span><i class="standard-bar"></i>Existing</span><span><i class="enhanced-bar"></i>Enhanced</span></div>${bars}</div>`;
+  return `<div class="sop3-scaling-chart"><div class="sop3-chart-head"><strong>Initial Assignment Runtime Scaling</strong><span>Median initial runtime; UI rendering excluded</span></div><div class="sop3-chart-legend"><span><i class="standard-bar"></i>Standard</span><span><i class="enhanced-bar"></i>Enhanced</span></div>${bars}</div>`;
 }
 
 function formatOverheadRatio(existing, enhanced) {
@@ -1936,12 +1987,33 @@ function renderSop3RuntimeSummaryTable(benchmarks) {
   const rows = benchmarks.filter(row => row.status === 'Complete');
   if (!rows.length) return '';
   const body = rows.map(row => {
-    const existing = getSummaryMedian(row.standardOverall);
-    const enhanced = getSummaryMedian(row.enhancedOverall);
+    const existing = getSummaryMedian(row.standardInitial);
+    const enhanced = getSummaryMedian(row.enhancedInitial);
     const diff = isFiniteNumber(existing) && isFiniteNumber(enhanced) ? enhanced - existing : null;
-    return `<tr><td>${row.size}x${row.size}</td><td>${formatDurationMs(existing)}</td><td>${formatDurationMs(enhanced)}</td><td>${formatDurationMs(Math.abs(diff))}${diff > 0 ? ' slower' : diff < 0 ? ' faster' : ''}</td><td>${formatOverheadRatio(existing, enhanced)}</td></tr>`;
+    return `<tr><td>${row.size}x${row.size}</td><td>${formatDefenseDuration(existing)}</td><td>${formatDefenseDuration(enhanced)}</td><td>${formatDefenseDuration(Math.abs(diff))}${diff > 0 ? ' slower' : diff < 0 ? ' faster' : ''}</td></tr>`;
   }).join('');
-  return `<div class="table-wrap compare-table-wrap sop3-runtime-summary-wrap"><table class="compare-table sop3-runtime-summary-table"><caption>SOP 3 Runtime Summary</caption><thead><tr><th>Matrix Size</th><th>Existing Median Runtime</th><th>Enhanced Median Runtime</th><th>Absolute Runtime Difference</th><th>Relative Overhead Ratio</th></tr></thead><tbody>${body}</tbody></table></div>`;
+  return `<div class="table-wrap compare-table-wrap sop3-runtime-summary-wrap"><table class="compare-table sop3-runtime-summary-table defense-table"><caption>SOP 3 Initial Runtime Summary</caption><thead><tr><th>Matrix Size</th><th>Standard Initial Time</th><th>Enhanced Initial Time</th><th>Difference</th></tr></thead><tbody>${body}</tbody></table></div>`;
+}
+
+function formatAgreement(validation) {
+  if (!validation || !isFiniteNumber(validation.agreementRate)) return 'N/A';
+  return `${validation.agreement} / ${validation.total} (${formatPercent(validation.agreementRate)})`;
+}
+
+function formatConstraintValidity(validation) {
+  if (!validation) return 'N/A';
+  return validation.fullOneToOne && validation.selectiveOneToOne ? 'Valid' : 'Invalid';
+}
+
+function renderSelectiveValidationTable(benchmarks) {
+  const rows = benchmarks.filter(row => row.status === 'Complete');
+  if (!rows.length) return '';
+  const body = rows.flatMap(row => (row.events || []).map(event => {
+    const validation = event.validation;
+    if (!validation) return `<tr><td>${row.size}x${row.size}</td><td>${event.eventNumber}</td><td colspan="6">No validation result recorded for this event.</td></tr>`;
+    return `<tr><td>${row.size}x${row.size}</td><td>${event.eventNumber}</td><td>${round(validation.fullCost, 6)}</td><td>${round(validation.selectiveCost, 6)}</td><td>${round(validation.absCostDiff, 6)}</td><td>${formatAgreement(validation)}</td><td>${formatConstraintValidity(validation)}</td><td>${escapeHtml(validation.status)}${validation.globallyOptimal ? '<br><small>Selective matches the full-recompute optimum.</small>' : '<br><small>Full recompute is the global reference for this event.</small>'}</td></tr>`;
+  })).join('');
+  return `<details class="technical-details"><summary>View Selective Update Correctness Audit</summary><div class="table-wrap compare-table-wrap selective-validation-wrap"><table class="compare-table selective-validation-table"><caption>Enhanced Selective Update Correctness Validation</caption><thead><tr><th>Matrix Size</th><th>Event</th><th>Full Recompute Final Cost</th><th>Selective Final Cost</th><th>Absolute Cost Difference</th><th>Assignment Agreement</th><th>One-to-One Validity</th><th>Result</th></tr></thead><tbody>${body}</tbody></table></div><p class="compare-note">Validation compares the Enhanced full recompute result with the Enhanced selective update result for the same deterministic urgency event. Differences are reported rather than suppressed.</p></details>`;
 }
 
 function renderPhaseBreakdown(benchmarks, selectedSize = getSelectedComparisonSize()) {
@@ -1949,113 +2021,154 @@ function renderPhaseBreakdown(benchmarks, selectedSize = getSelectedComparisonSi
   const row = complete.find(item => item.size === selectedSize) || complete[complete.length - 1];
   if (!row?.phases) return '';
   const sumPhase = (group, keys) => keys.reduce((total, key) => total + (getSummaryMedian(group?.[key]) || 0), 0);
+  const standardInitial = getSummaryMedian(row.standardInitial);
+  const enhancedInitial = getSummaryMedian(row.enhancedInitial);
+  const fullTotal = getSummaryMedian(row.enhancedFullReassignTotal);
+  const selectiveTotal = getSummaryMedian(row.enhancedSelectiveReassignTotal);
+  const initialStandardCost = sumPhase(row.phases.standardInitial, ['matrixConstructionMs']);
+  const initialEnhancedCost = sumPhase(row.phases.enhancedInitial, ['matrixConstructionMs']);
+  const initialStandardHungarian = sumPhase(row.phases.standardInitial, ['hungarianMs']);
+  const initialEnhancedHungarian = sumPhase(row.phases.enhancedInitial, ['hungarianMs']);
+  const fullMatrix = sumPhase(row.phases.enhancedFullDynamic, ['matrixConstructionMs', 'normalizationMs']);
+  const fullOptimization = sumPhase(row.phases.enhancedFullDynamic, ['hungarianMs']);
+  const selectiveMatrix = sumPhase(row.phases.enhancedSelectiveDynamic, ['criteriaUpdateMs', 'affectedDiscoveryMs', 'candidateSelectionMs', 'constraintPreparationMs']);
+  const selectiveOptimization = sumPhase(row.phases.enhancedSelectiveDynamic, ['hungarianMs']);
+  const standardOther = standardInitial - initialStandardCost - initialStandardHungarian;
+  const enhancedOther = enhancedInitial - initialEnhancedCost - initialEnhancedHungarian;
+  const fullOther = fullTotal - fullMatrix - fullOptimization;
+  const selectiveOther = selectiveTotal - selectiveMatrix - selectiveOptimization;
   const phaseRows = [
     {
-      label: 'Preprocessing / normalization time',
-      standardInitial: sumPhase(row.phases.standardInitial, ['preprocessingMs']),
-      enhancedInitial: sumPhase(row.phases.enhancedInitial, ['preprocessingMs']),
-      standardDynamic: sumPhase(row.phases.standardDynamic, ['preprocessingMs', 'criteriaUpdateMs']),
-      enhancedDynamic: sumPhase(row.phases.enhancedDynamic, ['preprocessingMs', 'criteriaUpdateMs'])
+      label: 'Initial Assignment - Cost Matrix Construction',
+      standardInitial: initialStandardCost,
+      enhancedInitial: initialEnhancedCost,
+      enhancedFullDynamic: null,
+      enhancedSelectiveDynamic: null
     },
     {
-      label: 'Cost-matrix construction time',
-      standardInitial: sumPhase(row.phases.standardInitial, ['matrixConstructionMs']),
-      enhancedInitial: sumPhase(row.phases.enhancedInitial, ['matrixConstructionMs']),
-      standardDynamic: sumPhase(row.phases.standardDynamic, ['matrixConstructionMs', 'subproblemBuildMs']),
-      enhancedDynamic: sumPhase(row.phases.enhancedDynamic, ['matrixConstructionMs', 'subproblemBuildMs'])
+      label: 'Initial Assignment - Hungarian Optimization',
+      standardInitial: initialStandardHungarian,
+      enhancedInitial: initialEnhancedHungarian,
+      enhancedFullDynamic: null,
+      enhancedSelectiveDynamic: null
     },
     {
-      label: 'Hungarian optimization time',
-      standardInitial: sumPhase(row.phases.standardInitial, ['hungarianMs']),
-      enhancedInitial: sumPhase(row.phases.enhancedInitial, ['hungarianMs']),
-      standardDynamic: sumPhase(row.phases.standardDynamic, ['hungarianMs']),
-      enhancedDynamic: sumPhase(row.phases.enhancedDynamic, ['hungarianMs'])
-    },
-    {
-      label: 'Dynamic re-assignment time',
+      label: 'Dynamic Full Recompute - Cost Matrix Update / Reconstruction',
       standardInitial: null,
       enhancedInitial: null,
-      standardDynamic: getSummaryMedian(row.standardReassignTotal),
-      enhancedDynamic: getSummaryMedian(row.enhancedReassignTotal)
+      enhancedFullDynamic: fullMatrix,
+      enhancedSelectiveDynamic: null
+    },
+    {
+      label: 'Dynamic Full Recompute - Optimization',
+      standardInitial: null,
+      enhancedInitial: null,
+      enhancedFullDynamic: fullOptimization,
+      enhancedSelectiveDynamic: null
+    },
+    {
+      label: 'Dynamic Selective Update - Selective Matrix Update',
+      standardInitial: null,
+      enhancedInitial: null,
+      enhancedFullDynamic: null,
+      enhancedSelectiveDynamic: selectiveMatrix
+    },
+    {
+      label: 'Dynamic Selective Update - Full Hungarian Optimization',
+      standardInitial: null,
+      enhancedInitial: null,
+      enhancedFullDynamic: null,
+      enhancedSelectiveDynamic: selectiveOptimization
+    },
+    {
+      label: 'Other Processing - Other measured overhead',
+      standardInitial: standardOther,
+      enhancedInitial: enhancedOther,
+      enhancedFullDynamic: fullOther,
+      enhancedSelectiveDynamic: selectiveOther
     },
     {
       label: 'UI rendering excluded from research timing',
       standardInitial: sumPhase(row.phases.standardInitial, ['uiRenderingMs']),
       enhancedInitial: sumPhase(row.phases.enhancedInitial, ['uiRenderingMs']),
-      standardDynamic: sumPhase(row.phases.standardDynamic, ['uiRenderingMs']),
-      enhancedDynamic: sumPhase(row.phases.enhancedDynamic, ['uiRenderingMs'])
+      enhancedFullDynamic: sumPhase(row.phases.enhancedFullDynamic, ['uiRenderingMs']),
+      enhancedSelectiveDynamic: sumPhase(row.phases.enhancedSelectiveDynamic, ['uiRenderingMs'])
     }
   ];
   const phaseValue = value => value === null ? 'N/A' : formatDurationMs(value);
-  const body = phaseRows.map(item => `<tr><td>${escapeHtml(item.label)}</td><td>${phaseValue(item.standardInitial)}</td><td>${phaseValue(item.enhancedInitial)}</td><td>${phaseValue(item.standardDynamic)}</td><td>${phaseValue(item.enhancedDynamic)}</td></tr>`).join('');
-  return `<details class="technical-details"><summary>View Performance Phase Breakdown (${row.size}x${row.size})</summary><div class="table-wrap compare-table-wrap"><table class="compare-table phase-breakdown-table"><thead><tr><th>Phase</th><th>Existing Initial</th><th>Enhanced Initial</th><th>Existing Dynamic Total</th><th>Enhanced Dynamic Total</th></tr></thead><tbody>${body}</tbody></table></div><p class="compare-note">UI rendering is explicitly excluded from research execution-time measurements.</p></details>`;
+  const body = phaseRows.map(item => `<tr><td>${escapeHtml(item.label)}</td><td>${phaseValue(item.standardInitial)}</td><td>${phaseValue(item.enhancedInitial)}</td><td>${phaseValue(item.enhancedFullDynamic)}</td><td>${phaseValue(item.enhancedSelectiveDynamic)}</td></tr>`).join('');
+  return `<div class="table-wrap compare-table-wrap"><table class="compare-table phase-breakdown-table defense-table"><caption>Technical Phase Breakdown (${row.size}x${row.size})</caption><thead><tr><th>Phase</th><th>Standard Initial</th><th>Enhanced Initial</th><th>Full Recompute</th><th>Selective Update</th></tr></thead><tbody>${body}</tbody></table></div><p class="compare-note">Phase rows group measured components for explanation. UI rendering is excluded.</p>`;
+}
+
+function renderDetailedBenchmarkStats(benchmarks) {
+  const rows = benchmarks.filter(row => row.status === 'Complete');
+  if (!rows.length) return '';
+  const body = rows.map(row => `<tr><td>${row.size}x${row.size}</td><td>${row.repetitions}</td><td>${row.warmups}</td><td>${formatTimingSummary(row.standardInitial)}</td><td>${formatTimingSummary(row.enhancedInitial)}</td><td>${formatTimingSummary(row.enhancedFullAverageReassign)}</td><td>${formatTimingSummary(row.enhancedSelectiveAverageReassign)}</td></tr>`).join('');
+  return `<div class="table-wrap compare-table-wrap benchmark-detail-wrap"><table class="compare-table benchmark-detail-table"><caption>Benchmark Details</caption><thead><tr><th>Matrix Size</th><th>Measured Repetitions</th><th>Warm-Ups</th><th>Standard Initial</th><th>Enhanced Initial</th><th>Full Recompute Avg/Event</th><th>Selective Update Avg/Event</th></tr></thead><tbody>${body}</tbody></table></div>`;
+}
+
+function renderSop3TechnicalDetails(benchmarks) {
+  return `<details class="technical-details sop3-technical-details"><summary>View Benchmark Details</summary>${renderDetailedBenchmarkStats(benchmarks)}${renderSelectiveValidationTable(benchmarks)}${renderPhaseBreakdown(benchmarks)}${renderSop3Interpretation(benchmarks)}</details>`;
 }
 
 function runDynamicPerformanceBenchmarkSample(rows, activeResources, events) {
   const standardInitial = runAssignment('existing', rows, activeResources);
   const enhancedInitial = runAssignment('enhanced', rows, activeResources);
-  let standardRows = rows.map(row => ({ ...row }));
-  let enhancedRows = rows.map(row => ({ ...row }));
-  let currentEnhanced = enhancedInitial;
-  const standardEventTimes = [];
-  const enhancedEventTimes = [];
-  const standardDynamicPhases = {};
-  const enhancedDynamicPhases = {};
+  let enhancedFullRows = rows.map(row => ({ ...row }));
+  let enhancedSelectiveRows = rows.map(row => ({ ...row }));
+  let currentFullEnhanced = enhancedInitial;
+  let currentSelectiveEnhanced = enhancedInitial;
+  const enhancedFullEventTimes = [];
+  const enhancedSelectiveEventTimes = [];
+  const enhancedFullDynamicPhases = {};
+  const enhancedSelectiveDynamicPhases = {};
   const eventLogs = [];
   events.forEach(event => {
     if (!event.triggered) {
-      standardEventTimes.push(0);
-      enhancedEventTimes.push(0);
-      eventLogs.push({ ...event, standardMs: 0, enhancedMs: 0, changed: false });
+      enhancedFullEventTimes.push(0);
+      enhancedSelectiveEventTimes.push(0);
+      eventLogs.push({ ...event, fullMs: 0, selectiveMs: 0, changed: false });
       return;
     }
-    const previousAssignment = getResultAssignmentForRow(currentEnhanced, enhancedRows[event.householdIndex]);
-    standardRows = applyDynamicEventRows(standardRows, event);
-    enhancedRows = applyDynamicEventRows(enhancedRows, event);
-    const standardRecomputed = runAssignment('existing', standardRows, activeResources);
-    currentEnhanced = selectiveEnhancedReassignment(currentEnhanced, enhancedRows, activeResources, [event.householdIndex]);
-    const updatedAssignment = getResultAssignmentForRow(currentEnhanced, enhancedRows[event.householdIndex]);
-    standardEventTimes.push(standardRecomputed.durationMs);
-    enhancedEventTimes.push(currentEnhanced.durationMs);
-    addPhaseTimings(standardDynamicPhases, standardRecomputed.phaseTimings);
-    addPhaseTimings(enhancedDynamicPhases, currentEnhanced.phaseTimings);
+    const previousAssignment = getResultAssignmentForRow(currentSelectiveEnhanced, enhancedSelectiveRows[event.householdIndex]);
+    enhancedFullRows = applyDynamicEventRows(enhancedFullRows, event);
+    enhancedSelectiveRows = applyDynamicEventRows(enhancedSelectiveRows, event);
+    currentFullEnhanced = runAssignment('enhanced', enhancedFullRows, activeResources);
+    currentSelectiveEnhanced = selectiveEnhancedReassignment(currentSelectiveEnhanced, enhancedSelectiveRows, activeResources, [event.householdIndex]);
+    const updatedAssignment = getResultAssignmentForRow(currentSelectiveEnhanced, enhancedSelectiveRows[event.householdIndex]);
+    const validation = buildSelectiveValidation(currentFullEnhanced, currentSelectiveEnhanced);
+    enhancedFullEventTimes.push(currentFullEnhanced.durationMs);
+    enhancedSelectiveEventTimes.push(currentSelectiveEnhanced.durationMs);
+    addPhaseTimings(enhancedFullDynamicPhases, currentFullEnhanced.phaseTimings);
+    addPhaseTimings(enhancedSelectiveDynamicPhases, currentSelectiveEnhanced.phaseTimings);
     eventLogs.push({
       ...event,
-      standardMs: standardRecomputed.durationMs,
-      enhancedMs: currentEnhanced.durationMs,
+      fullMs: currentFullEnhanced.durationMs,
+      selectiveMs: currentSelectiveEnhanced.durationMs,
+      validation,
       changed: previousAssignment?.resourceIndex !== updatedAssignment?.resourceIndex
     });
   });
-  const standardReassignTotal = standardEventTimes.reduce((sum, value) => sum + value, 0);
-  const enhancedReassignTotal = enhancedEventTimes.reduce((sum, value) => sum + value, 0);
+  const enhancedFullReassignTotal = enhancedFullEventTimes.reduce((sum, value) => sum + value, 0);
+  const enhancedSelectiveReassignTotal = enhancedSelectiveEventTimes.reduce((sum, value) => sum + value, 0);
   const eventCount = events.filter(event => event.triggered).length || events.length;
   return {
     standardInitialMs: standardInitial.durationMs,
     enhancedInitialMs: enhancedInitial.durationMs,
     standardInitialPhases: standardInitial.phaseTimings,
     enhancedInitialPhases: enhancedInitial.phaseTimings,
-    standardDynamicPhases,
-    enhancedDynamicPhases,
-    standardReassignTotal,
-    enhancedReassignTotal,
-    standardAverageReassign: eventCount ? standardReassignTotal / eventCount : null,
-    enhancedAverageReassign: eventCount ? enhancedReassignTotal / eventCount : null,
-    standardOverall: standardInitial.durationMs + standardReassignTotal,
-    enhancedOverall: enhancedInitial.durationMs + enhancedReassignTotal,
-    savedMs: standardReassignTotal - enhancedReassignTotal,
-    improvementRate: standardReassignTotal > 0 ? (standardReassignTotal - enhancedReassignTotal) / standardReassignTotal : null,
+    enhancedFullDynamicPhases,
+    enhancedSelectiveDynamicPhases,
+    enhancedFullReassignTotal,
+    enhancedSelectiveReassignTotal,
+    enhancedFullAverageReassign: eventCount ? enhancedFullReassignTotal / eventCount : null,
+    enhancedSelectiveAverageReassign: eventCount ? enhancedSelectiveReassignTotal / eventCount : null,
+    standardOverall: standardInitial.durationMs,
+    enhancedOverall: enhancedInitial.durationMs,
+    savedMs: enhancedFullReassignTotal - enhancedSelectiveReassignTotal,
+    improvementRate: enhancedFullReassignTotal > 0 ? (enhancedFullReassignTotal - enhancedSelectiveReassignTotal) / enhancedFullReassignTotal : null,
     events: eventLogs
   };
-}
-
-function calculateBreakEvenEvents(standardInitial, enhancedInitial, standardAverageReassign, enhancedAverageReassign) {
-  const initialOverhead = Number(enhancedInitial) - Number(standardInitial);
-  const perEventSaving = Number(standardAverageReassign) - Number(enhancedAverageReassign);
-  if (!Number.isFinite(initialOverhead) || !Number.isFinite(perEventSaving)) return { label: 'N/A', events: null };
-  if (perEventSaving <= 0) return { label: 'N/A', events: null };
-  if (initialOverhead <= 0) return { label: 'Immediate', events: 0 };
-  const events = Math.ceil(initialOverhead / perEventSaving);
-  return { label: `${events} qualifying events`, events };
 }
 
 function runDynamicPerformanceBenchmark(rows, activeResources) {
@@ -2069,41 +2182,34 @@ function runDynamicPerformanceBenchmark(rows, activeResources) {
   const samples = Array.from({ length: BENCHMARK_REPETITIONS }, () => runDynamicPerformanceBenchmarkSample(rows, activeResources, events));
   const standardInitial = summarizeSamples(samples.map(sample => sample.standardInitialMs));
   const enhancedInitial = summarizeSamples(samples.map(sample => sample.enhancedInitialMs));
-  const standardAverageReassign = summarizeSamples(samples.map(sample => sample.standardAverageReassign));
-  const enhancedAverageReassign = summarizeSamples(samples.map(sample => sample.enhancedAverageReassign));
-  const standardReassignTotal = summarizeSamples(samples.map(sample => sample.standardReassignTotal));
-  const enhancedReassignTotal = summarizeSamples(samples.map(sample => sample.enhancedReassignTotal));
+  const enhancedFullAverageReassign = summarizeSamples(samples.map(sample => sample.enhancedFullAverageReassign));
+  const enhancedSelectiveAverageReassign = summarizeSamples(samples.map(sample => sample.enhancedSelectiveAverageReassign));
+  const enhancedFullReassignTotal = summarizeSamples(samples.map(sample => sample.enhancedFullReassignTotal));
+  const enhancedSelectiveReassignTotal = summarizeSamples(samples.map(sample => sample.enhancedSelectiveReassignTotal));
   const standardOverall = summarizeSamples(samples.map(sample => sample.standardOverall));
   const enhancedOverall = summarizeSamples(samples.map(sample => sample.enhancedOverall));
-  const savedMs = getSummaryMedian(standardReassignTotal) - getSummaryMedian(enhancedReassignTotal);
-  const improvementRate = getSummaryMedian(standardReassignTotal) > 0 ? savedMs / getSummaryMedian(standardReassignTotal) : null;
-  const breakEven = calculateBreakEvenEvents(
-    getSummaryMedian(standardInitial),
-    getSummaryMedian(enhancedInitial),
-    getSummaryMedian(standardAverageReassign),
-    getSummaryMedian(enhancedAverageReassign)
-  );
+  const savedMs = getSummaryMedian(enhancedFullReassignTotal) - getSummaryMedian(enhancedSelectiveReassignTotal);
+  const improvementRate = getSummaryMedian(enhancedFullReassignTotal) > 0 ? savedMs / getSummaryMedian(enhancedFullReassignTotal) : null;
   return {
     status: 'Complete',
     repetitions: BENCHMARK_REPETITIONS,
     warmups: BENCHMARK_WARMUP_RUNS,
     standardInitial,
     enhancedInitial,
-    standardReassignTotal,
-    enhancedReassignTotal,
-    standardAverageReassign,
-    enhancedAverageReassign,
+    enhancedFullReassignTotal,
+    enhancedSelectiveReassignTotal,
+    enhancedFullAverageReassign,
+    enhancedSelectiveAverageReassign,
     standardOverall,
     enhancedOverall,
     phases: {
       standardInitial: summarizePhaseTimings(samples, sample => sample.standardInitialPhases),
       enhancedInitial: summarizePhaseTimings(samples, sample => sample.enhancedInitialPhases),
-      standardDynamic: summarizePhaseTimings(samples, sample => sample.standardDynamicPhases),
-      enhancedDynamic: summarizePhaseTimings(samples, sample => sample.enhancedDynamicPhases)
+      enhancedFullDynamic: summarizePhaseTimings(samples, sample => sample.enhancedFullDynamicPhases),
+      enhancedSelectiveDynamic: summarizePhaseTimings(samples, sample => sample.enhancedSelectiveDynamicPhases)
     },
     savedMs,
     improvementRate,
-    breakEven,
     quality: {
       standard: standardQuality.metrics,
       enhanced: enhancedQuality.metrics,
@@ -2127,11 +2233,15 @@ function buildBenchmarkRows(rows, sizes = [getSelectedComparisonSize()]) {
 function renderBenchmarkTable(rows, sizes = [getSelectedComparisonSize()]) {
   const benchmarks = buildBenchmarkRows(rows, sizes);
   state.latestBenchmarks = benchmarks;
-  const table = `<div class="table-wrap benchmark-wrap"><table class="compare-table benchmark-table sop3-benchmark-table"><caption>SOP 3 - Computational Performance and Allocation Quality</caption><thead><tr><th>Records Compared</th><th>Mean Allocation Accuracy</th><th>Prioritization Efficiency</th><th>Common Composite Cost</th><th>Initial Time</th><th>Avg Dynamic Time</th><th>Total Dynamic Time</th><th>Overall Time</th><th>Dynamic Saved</th><th>Dynamic Improvement</th></tr></thead><tbody>${benchmarks.map(row => {
-    if (row.status !== 'Complete') return `<tr><td>${row.size}x${row.size}</td><td colspan="9">${escapeHtml(row.status)}</td></tr>`;
-    return `<tr><td>${row.size}x${row.size}<br><small>${row.repetitions} reps after ${row.warmups} warm-ups</small></td><td>${formatMetricPair(row.quality.standard.allocationAccuracy, row.quality.enhanced.allocationAccuracy, formatPercent)}</td><td>${formatMetricPair(row.quality.standard.prioritizationEfficiency, row.quality.enhanced.prioritizationEfficiency, formatPercent)}</td><td>${formatMetricPair(row.quality.standardComparableCost, row.quality.enhancedComparableCost, value => round(value, 3))}</td><td>${formatMetricPair(row.standardInitial, row.enhancedInitial, formatTimingSummary)}</td><td>${formatMetricPair(row.standardAverageReassign, row.enhancedAverageReassign, formatTimingSummary)}</td><td>${formatMetricPair(row.standardReassignTotal, row.enhancedReassignTotal, formatTimingSummary)}</td><td>${formatMetricPair(row.standardOverall, row.enhancedOverall, formatTimingSummary)}</td><td>${formatDynamicTimeSaved(row.savedMs)}</td><td>${formatDynamicImprovement(row.improvementRate, row.savedMs)}</td></tr>`;
+  const initialTable = `<div class="table-wrap benchmark-wrap"><table class="compare-table benchmark-table sop3-benchmark-table defense-table"><caption>SOP 3A - Initial Assignment</caption><thead><tr><th>Matrix Size</th><th>Standard Compatibility Score</th><th>Enhanced Compatibility Score</th><th>Standard Prioritization Efficiency</th><th>Enhanced Prioritization Efficiency</th><th>Standard Initial Time</th><th>Enhanced Initial Time</th></tr></thead><tbody>${benchmarks.map(row => {
+    if (row.status !== 'Complete') return `<tr><td>${row.size}x${row.size}</td><td colspan="6">${escapeHtml(row.status)}</td></tr>`;
+    return `<tr><td>${row.size}x${row.size}</td><td>${formatCompactPercent(row.quality.standard.allocationAccuracy)}</td><td>${formatCompactPercent(row.quality.enhanced.allocationAccuracy)}</td><td>${formatCompactPercent(row.quality.standard.prioritizationEfficiency)}</td><td>${formatCompactPercent(row.quality.enhanced.prioritizationEfficiency)}</td><td>${formatMedianDefenseDuration(row.standardInitial)}</td><td>${formatMedianDefenseDuration(row.enhancedInitial)}</td></tr>`;
   }).join('')}</tbody></table></div>`;
-  return table + renderSop3ScalingChart(benchmarks) + renderSop3RuntimeSummaryTable(benchmarks) + renderPhaseBreakdown(benchmarks) + renderSop3Interpretation(benchmarks);
+  const dynamicTable = `<div class="table-wrap benchmark-wrap"><table class="compare-table benchmark-table sop3-benchmark-table defense-table"><caption>SOP 3B - Dynamic Re-Assignment</caption><thead><tr><th>Matrix Size</th><th>Full Recompute Time</th><th>Selective Update Time</th><th>Time Saved</th><th>Dynamic Time Reduction</th></tr></thead><tbody>${benchmarks.map(row => {
+    if (row.status !== 'Complete') return `<tr><td>${row.size}x${row.size}</td><td colspan="4">${escapeHtml(row.status)}</td></tr>`;
+    return `<tr><td>${row.size}x${row.size}</td><td>${formatMedianDefenseDuration(row.enhancedFullReassignTotal)}</td><td>${formatMedianDefenseDuration(row.enhancedSelectiveReassignTotal)}</td><td>${formatDefenseTimeSaved(row.savedMs)}</td><td>${formatDynamicImprovement(row.improvementRate, row.savedMs)}</td></tr>`;
+  }).join('')}</tbody></table></div>`;
+  return initialTable + renderSop3ScalingChart(benchmarks) + renderSop3RuntimeSummaryTable(benchmarks) + renderSop3AInterpretation(benchmarks) + dynamicTable + renderSop3BInterpretation(benchmarks) + renderSop3TechnicalDetails(benchmarks);
 }
 
 function renderSop2Summary(dynamic, rows, activeResources, previousCompositeCost, updatedCompositeCost, compositeCostDiff, changedByDynamic) {
@@ -2141,8 +2251,8 @@ function renderSop2Summary(dynamic, rows, activeResources, previousCompositeCost
     { label: 'Test Events', value: `5 events | ${rows.length}x${activeResources.length}`, note: 'Controlled urgency-change test' },
     { label: 'Trigger Rule', value: triggered ? 'Triggered' : 'Not triggered', note: 'Delta >= 2' },
     { label: 'Affected Households', value: dynamic.affectedCount, note: 'Rows updated by urgency change' },
-    { label: 'Existing Method', value: formatDurationMs(dynamic.standardDurationMs), note: triggered ? 'Full distance-only recomputation' : 'No recomputation' },
-    { label: 'Enhanced Method', value: formatDurationMs(dynamic.durationMs), note: triggered ? 'Selective re-optimization with one-to-one constraints' : 'No selective update' },
+    { label: 'Standard Method', value: 'No urgency-driven recomputation', note: 'Distance-only objective is unchanged by urgency' },
+    { label: 'Enhanced Method', value: formatDurationMs(dynamic.durationMs), note: triggered ? 'Selective matrix update plus full Hungarian optimization' : 'No selective update' },
     { label: 'Composite Cost', value: `${round(previousCompositeCost, 3)} to ${round(updatedCompositeCost, 3)}`, note: `Change ${formatSignedNumber(compositeCostDiff, 3)}` },
     { label: 'Assignment Result', value: changedByDynamic ? 'Changed' : 'Same', note: 'A same output is valid when optimum is unchanged' }
   ];
@@ -2174,7 +2284,7 @@ function renderComparisonReport(existing, enhanced, rows, activeResources) {
     : null;
   const sop1Rows = [
     { metric: 'Criteria Used', standard: formatCriterionList(['Distance']), enhanced: formatCriterionList(['Distance', 'Urgency', 'Compatibility']), difference: 'Model design' },
-    { metric: 'Mean Allocation Accuracy (Compatibility Score)', standard: formatPercent(existing.metrics.allocationAccuracy), enhanced: formatPercent(enhanced.metrics.allocationAccuracy), difference: formatPercentagePoint(enhanced.metrics.allocationAccuracy - existing.metrics.allocationAccuracy), note: 'Mean resource-need compatibility score of the final assignments.' },
+    { metric: 'Mean Resource-Need Compatibility Score', standard: formatPercent(existing.metrics.allocationAccuracy), enhanced: formatPercent(enhanced.metrics.allocationAccuracy), difference: formatPercentagePoint(enhanced.metrics.allocationAccuracy - existing.metrics.allocationAccuracy), note: 'Mean assigned resource-to-household need compatibility score of the final assignments; no labeled ground-truth accuracy set is used.' },
     { metric: 'Prioritization Efficiency', standard: formatPercent(existing.metrics.prioritizationEfficiency), enhanced: formatPercent(enhanced.metrics.prioritizationEfficiency), difference: formatPrioritizationChange(existing.metrics.prioritizationEfficiency, enhanced.metrics.prioritizationEfficiency), note: 'Urgency-weighted compatibility score of the actual assignment output.' },
     { metric: 'Total Physical Distance', standard: formatDistanceKm(existing.metrics.totalDistance), enhanced: formatDistanceKm(enhanced.metrics.totalDistance), difference: formatSignedNumber(enhanced.metrics.totalDistance - existing.metrics.totalDistance, 2, ' km') },
     { metric: 'Common Composite Cost Evaluation', standard: round(existingComparableCost, 3), enhanced: round(enhancedComparableCost, 3), difference: formatSignedNumber(enhancedComparableCost - existingComparableCost, 3), note: 'Both final solutions are evaluated using the same proposed weighted cost function for fair comparison. Lower composite cost is better.' },
@@ -2182,16 +2292,15 @@ function renderComparisonReport(existing, enhanced, rows, activeResources) {
     { metric: 'Native Optimization Objective', standard: formatNativeCost(existing), enhanced: formatNativeCost(enhanced), difference: 'N/A - different objective functions', note: "Native costs are reported in each algorithm's own objective units and are not directly comparable." }
   ];
   const changedByDynamic = dynamic.events.some(event => event.changed);
-  const dynamicDetailRows = dynamic.events.map(event => `<tr><td data-label="Event"><strong class="event-number">${event.eventNumber}</strong></td><td data-label="Household"><strong>${escapeHtml(getHouseholdId(event.household) || event.household.household_id || 'H*')}</strong><small>Urgency ${round(event.previousUrgency, 1)} to ${round(event.newUrgency, 1)} | Delta ${round(event.delta, 1)}</small></td><td data-label="Timing"><div class="sop2-mini-grid"><span>Existing</span><strong>${formatDurationMs(event.standardMs)}</strong><span>Enhanced</span><strong>${formatDurationMs(event.enhancedMs)}</strong></div></td><td data-label="Composite Cost"><div class="sop2-mini-grid"><span>Before</span><strong>${round(event.previousCompositeCost, 3)}</strong><span>After</span><strong>${round(event.updatedCompositeCost, 3)}</strong><span>Change</span><strong>${formatSignedNumber(event.compositeCostDiff, 3)}</strong></div></td><td data-label="Assignment"><div class="sop2-assignment-flow"><span>${escapeHtml(assignmentLabel(event.previousAssignment))}</span><b>to</b><span>${escapeHtml(assignmentLabel(event.updatedAssignment))}</span></div><strong class="${event.changed ? 'changed-yes' : 'changed-no'}">${event.changed ? 'Changed' : 'Same'}</strong></td></tr>`).join('');
+  const dynamicDetailRows = dynamic.events.map(event => `<tr><td data-label="Event"><strong class="event-number">${event.eventNumber}</strong></td><td data-label="Household"><strong>${escapeHtml(getHouseholdId(event.household) || event.household.household_id || 'H*')}</strong><small>Urgency ${round(event.previousUrgency, 1)} to ${round(event.newUrgency, 1)} | Delta ${round(event.delta, 1)}</small></td><td data-label="Timing"><div class="sop2-mini-grid"><span>Standard</span><strong>No urgency recompute</strong><span>Enhanced selective</span><strong>${formatDurationMs(event.enhancedMs)}</strong></div></td><td data-label="Composite Cost"><div class="sop2-mini-grid"><span>Before</span><strong>${round(event.previousCompositeCost, 3)}</strong><span>After</span><strong>${round(event.updatedCompositeCost, 3)}</strong><span>Change</span><strong>${formatSignedNumber(event.compositeCostDiff, 3)}</strong></div></td><td data-label="Assignment"><div class="sop2-assignment-flow"><span>${escapeHtml(assignmentLabel(event.previousAssignment))}</span><b>to</b><span>${escapeHtml(assignmentLabel(event.updatedAssignment))}</span></div><strong class="${event.changed ? 'changed-yes' : 'changed-no'}">${event.changed ? 'Changed' : 'Same'}</strong></td></tr>`).join('');
   const sop2Table = dynamic.events.length
-    ? `${renderSop2Summary(dynamic, rows, activeResources, dynamicPreviousComposite, dynamicUpdatedComposite, dynamicCompositeDiff, changedByDynamic)}${renderSop2Interpretation(dynamic)}<p class="compare-note">SOP 2 uses the same deterministic five-event urgency-change test used in SOP 3 for the currently selected matrix size. Timing values are measured live and can vary slightly; changing the matrix size changes which households are included.</p><details class="technical-details sop2-details"><summary>View Dynamic Event Details</summary><div class="table-wrap compare-table-wrap sop2-detail-wrap"><table class="compare-table sop2-detail-table"><thead><tr><th>Event</th><th>Household & Urgency Change</th><th>Run Time</th><th>Composite Cost</th><th>Assignment Result</th></tr></thead><tbody>${dynamicDetailRows}</tbody></table></div></details>`
+    ? `${renderSop2Summary(dynamic, rows, activeResources, dynamicPreviousComposite, dynamicUpdatedComposite, dynamicCompositeDiff, changedByDynamic)}${renderSop2Interpretation(dynamic)}<p class="compare-note">SOP 2 uses the same deterministic five-event urgency-change test used in SOP 3 for the currently selected matrix size. Standard does not rerun for urgency-only changes because its distance-only cost matrix is unchanged. Enhanced updates the necessary urgency-derived cost-matrix information, refreshes normalization-dependent values through the complete matrix, and solves the full Hungarian assignment. Timing values are measured live and can vary slightly; changing the matrix size changes which households are included.</p><details class="technical-details sop2-details"><summary>View Dynamic Event Details</summary><div class="table-wrap compare-table-wrap sop2-detail-wrap"><table class="compare-table sop2-detail-table"><thead><tr><th>Event</th><th>Household & Urgency Change</th><th>Run Time</th><th>Composite Cost</th><th>Assignment Result</th></tr></thead><tbody>${dynamicDetailRows}</tbody></table></div></details>`
     : '<div class="notice-panel">SOP 2 is not measurable for this run because the selected dataset has no valid urgency values to update.</div>';
   const assignmentDetails = `<details class="technical-details"><summary>View Household-Level Assignment Comparison</summary>${renderHouseholdComparisonTable(householdRows)}</details>`;
   const technicalDetails = `<details class="technical-details"><summary>View Technical Details</summary><p class="compare-note">Existing distance-only matrix summary: ${escapeHtml(formatMatrixSummary(existing, 'km'))}. Enhanced matrix summary: ${escapeHtml(formatMatrixSummary(enhanced))}. Enhanced weights: distance ${state.weights.distance.toFixed(3)}, urgency ${state.weights.urgency.toFixed(3)}, compatibility ${state.weights.compatibility.toFixed(3)}.</p></details>`;
   const sop3Table = renderBenchmarkTable(getVerifiedHouseholdSet(), BENCHMARK_MATRIX_SIZES);
-  const researchConclusion = renderResearchConclusion(existing, enhanced, dynamic, state.latestBenchmarks || [], existingComparableCost, enhancedComparableCost);
   state.currentResources = activeResources;
-  $('#compare-content').innerHTML = `<section class="panel compare-section"><div class="panel-head"><div><p class="eyebrow">SOP 1</p><h3>Multi-Criteria Allocation Comparison</h3></div></div>${renderComparisonDataNotes(existing, enhanced, householdRows, rows, activeResources)}${renderComparisonTable(sop1Rows, 'SOP 1 - Multi-Criteria Allocation Comparison')}${renderSop1Interpretation(existing, enhanced, changedCount, rows, existingComparableCost, enhancedComparableCost)}<p class="compare-note">Existing uses distance only. Enhanced uses the proposed weighted cost matrix: distance + urgency + compatibility. Native optimization objectives are shown as context only because they use different units.</p></section><section class="panel compare-section"><div class="panel-head"><div><p class="eyebrow">SOP 2</p><h3>Dynamic Re-Assignment Evaluation</h3></div></div>${sop2Table}</section><section class="panel compare-section"><div class="panel-head"><div><p class="eyebrow">SOP 3</p><h3>Computational Performance</h3></div></div>${sop3Table}<p class="compare-note">SOP 3 separates initial assignment time from dynamic re-assignment time. Results are measured using the implemented application under controlled and repeated benchmark conditions. Both algorithms use identical datasets and test scenarios.</p></section>${researchConclusion}${assignmentDetails}${technicalDetails}`;
+  $('#compare-content').innerHTML = `<details class="panel compare-section expandable-panel" open><summary class="panel-head expandable-summary"><div><p class="eyebrow">SOP 1</p><h3>Multi-Criteria Allocation Comparison</h3></div><span class="expand-label">Toggle details</span></summary>${renderComparisonDataNotes(existing, enhanced, householdRows, rows, activeResources)}${renderComparisonTable(sop1Rows, 'SOP 1 - Multi-Criteria Allocation Comparison')}${renderSop1Interpretation(existing, enhanced, changedCount, rows, existingComparableCost, enhancedComparableCost)}<p class="compare-note">Existing uses distance only. Enhanced uses the proposed weighted cost matrix: distance + urgency + compatibility. Native optimization objectives are shown as context only because they use different units.</p></details><details class="panel compare-section expandable-panel" open><summary class="panel-head expandable-summary"><div><p class="eyebrow">SOP 2</p><h3>Dynamic Re-Assignment Evaluation</h3></div><span class="expand-label">Toggle details</span></summary>${sop2Table}</details><details class="panel compare-section expandable-panel" open><summary class="panel-head expandable-summary"><div><p class="eyebrow">SOP 3</p><h3>Computational Performance</h3></div><span class="expand-label">Toggle details</span></summary>${sop3Table}<p class="compare-note">SOP 3 separates initial assignment time from dynamic re-assignment time. Results are measured using the implemented application under controlled and repeated benchmark conditions. Both algorithms use identical datasets and test scenarios.</p></details>${assignmentDetails}${technicalDetails}`;
   bindComparisonReport(householdRows);
 }
 
