@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Relief Allocation | Research Evaluation</title>
+<link rel="icon" type="image/png" href="HUNGARIAN%20LOGO.png">
+<link rel="apple-touch-icon" href="HUNGARIAN%20LOGO.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -12,7 +14,7 @@
 </head>
 <body>
 <aside class="sidebar">
-  <a class="logo" href="#existing"><span>HA</span><strong>Hungarian<br>Algorithm</strong></a>
+  <a class="logo" href="#existing"><span><img src="HUNGARIAN%20LOGO.png" alt="Hungarian Algorithm logo"></span><strong>Hungarian<br>Algorithm</strong></a>
   <p class="nav-label">Research tabs</p>
   <nav>
     <a class="nav-item active" href="#existing" data-page="existing"><span>1</span>Standard</a>
@@ -28,7 +30,7 @@
     <p class="breadcrumb">Research evaluation <span>/</span> <strong id="page-title">Standard</strong></p>
     <h1 id="header-title">Standard Hungarian Algorithm - Distance-Only Baseline</h1>
   </div>
-  <div class="top-actions"><div class="dataset-pill"><span class="status-dot"></span><span id="top-dataset">No dataset loaded</span></div></div>
+  <div class="top-actions"><div class="dataset-pill no-dataset"><span class="status-dot"></span><span id="top-dataset">No dataset loaded</span></div></div>
 </header>
 <main>
 <div class="view active" id="view-existing">
@@ -50,7 +52,7 @@
     <div class="panel-head"><div><p class="eyebrow">Shared input</p><h3>Validated household and resource data</h3></div><div class="title-actions"><button class="secondary-button" id="load-demo-data" type="button">Load Demo Data</button><label class="secondary-button upload-button">Upload Resources <input id="resource-file-input" type="file" accept=".csv,text/csv,.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"></label><label class="primary-button upload-button">Upload Households <input id="file-input" type="file" accept=".csv,text/csv,.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"></label></div></div>
     <div class="upload-panel"><div class="upload-icon">UP</div><div><h3>Import household and relief resource data</h3><p>Upload household records and available resources. The app checks the records before running both allocation methods.</p></div><span class="upload-hint">CSV/XLSX</span></div>
     <div class="data-summary"><div><span>Dataset</span><strong id="data-name">-</strong></div><div><span>Rows</span><strong id="data-rows">0</strong></div><div><span>Columns</span><strong id="data-cols">0</strong></div><div><span>Invalid rows</span><strong id="data-missing">-</strong></div></div>
-    <section class="panel table-panel"><div class="panel-head"><div><p class="eyebrow">Preview</p><h3>Household records</h3></div><input class="search-input" id="table-search" placeholder="Search records" type="search"></div><div class="table-wrap"><table><thead id="data-head"></thead><tbody id="data-body"></tbody></table></div><div class="table-foot"><span id="table-count">No records</span><span>The same eligible households are used by both methods.</span></div></section>
+    <details class="panel table-panel expandable-panel" open><summary class="panel-head expandable-summary"><div><p class="eyebrow">Preview</p><h3>Household records review</h3></div><span class="expand-label">Toggle records</span></summary><input class="search-input review-search" id="table-search" placeholder="Search records" type="search"><div class="table-wrap"><table><thead id="data-head"></thead><tbody id="data-body"></tbody></table></div><div class="table-foot"><span id="table-count">No records</span><span>The same eligible households are used by both methods.</span></div></details>
   </section>
   <div id="compare-empty" class="notice-panel">Load and validate household data and relief resources, then run the research comparison.</div>
   <div id="compare-content" class="compare-content hidden"></div>

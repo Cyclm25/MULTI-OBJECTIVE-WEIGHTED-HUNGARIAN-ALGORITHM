@@ -1232,35 +1232,6 @@ tbody tr:hover td {
 	background: var(--accent-strong);
 }
 
-.research-status-grid {
-	display: grid;
-	grid-template-columns: repeat(3, minmax(0, 1fr));
-	gap: 12px;
-	margin-bottom: 14px;
-}
-
-.research-status-grid article {
-	padding: 15px;
-	border: 1px solid #dbe7e4;
-	border-radius: 10px;
-	background: #fbfefd;
-}
-
-.research-status-grid span {
-	display: block;
-	color: var(--muted);
-	font: 700 9px var(--mono);
-	letter-spacing: .05em;
-	text-transform: uppercase;
-}
-
-.research-status-grid strong {
-	display: block;
-	margin-top: 7px;
-	color: var(--forest);
-	font-size: 18px;
-}
-
 @media (max-width: 1200px) {
 	.sidebar {
 		width: 220px !important;
@@ -1508,8 +1479,7 @@ tbody tr:hover td {
 		grid-template-columns: minmax(0, 1fr);
 	}
 
-	.sop3-chart-row,
-	.research-status-grid {
+	.sop3-chart-row {
 		grid-template-columns: 1fr;
 	}
 
@@ -1969,8 +1939,101 @@ caption,
 	margin-bottom: 8px;
 }
 
+.expandable-panel {
+	display: block;
+}
+
+.expandable-panel > summary {
+	list-style: none;
+	cursor: pointer;
+}
+
+.expandable-panel > summary::-webkit-details-marker {
+	display: none;
+}
+
+.expandable-summary {
+	align-items: center;
+}
+
+.expand-label {
+	display: inline-flex;
+	align-items: center;
+	gap: 8px;
+	color: var(--forest);
+	font: 700 10px var(--mono);
+	letter-spacing: .04em;
+	text-transform: uppercase;
+}
+
+.expand-label::before {
+	content: "+";
+	display: grid;
+	width: 18px;
+	height: 18px;
+	place-items: center;
+	border: 1px solid var(--line);
+	border-radius: 50%;
+	background: #ffffff;
+	color: var(--forest);
+}
+
+.expandable-panel[open] > .expandable-summary .expand-label::before {
+	content: "-";
+}
+
+.review-search {
+	width: min(360px, 100%);
+	margin: 0 0 12px;
+}
+
 .status-dot {
 	background: var(--accent) !important;
+}
+
+.dataset-pill.no-dataset {
+	border-color: #dc2626 !important;
+	color: #dc2626 !important;
+}
+
+.dataset-pill.no-dataset .status-dot {
+	background: #dc2626 !important;
+}
+
+.defense-table {
+	table-layout: auto !important;
+}
+
+.defense-table th,
+.defense-table td {
+	text-align: right;
+	white-space: nowrap;
+}
+
+.defense-table th:first-child,
+.defense-table td:first-child {
+	width: auto !important;
+	text-align: left;
+}
+
+.sop3-defense-note {
+	margin: 10px 0 18px;
+	font-weight: 600;
+	color: var(--ink);
+}
+
+.logo span {
+	overflow: hidden;
+	background: transparent !important;
+	border: 0;
+	box-shadow: none;
+}
+
+.logo span img {
+	display: block;
+	width: 100%;
+	height: 100%;
+	object-fit: contain;
 }
 
 @media (max-width: 1200px) {
