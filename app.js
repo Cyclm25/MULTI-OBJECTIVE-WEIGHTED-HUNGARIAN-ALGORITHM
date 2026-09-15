@@ -905,12 +905,32 @@ function renderMetricSummary(items) {
 
 function renderWeightedCostMatrixDetails(result) {
   if (!result || result.mode !== 'enhanced') return '';
-  const rows = result.activeResources.map((resource, resourceIndex) => {
-    const values = (result.householdOrder || []).map((_, householdIndex) => `<td>${round(result.costMatrix?.[resourceIndex]?.[householdIndex], 3)}</td>`).join('');
-    return `<tr><td>${escapeHtml(resource.resource_id || `R${resourceIndex + 1}`)}</td>${values}</tr>`;
+  const householdOrder = result.householdOrder || [];
+  const matrixRows = result.matrixRows || result.activeResources?.length || 0;
+  const matrixColumns = result.matrixColumns || householdOrder.length || 0;
+  const possiblePairings = matrixRows * matrixColumns;
+  const weights = result.weights || state.weights || RESEARCH_WEIGHTS;
+  const assignmentCells = new Set((result.output || [])
+    .filter(item => typeof item.resourceIndex === 'number' && typeof item.householdIndex === 'number')
+    .map(item => `${item.resourceIndex}:${item.householdIndex}`));
+  const selectedRows = (result.output || []).map(item => {
+    const resource = result.activeResources?.[item.resourceIndex];
+    const resourceId = resource?.resource_id || item.resource || `R${Number(item.resourceIndex) + 1}`;
+    const householdId = getHouseholdId(item.household) || householdOrder[item.householdIndex] || item.household?.household_id || `H* ${Number(item.householdIndex) + 1}`;
+    return `<tr><td>${escapeHtml(resourceId)}</td><td>${escapeHtml(householdId)}</td><td>${round(item.value, 4)}</td><td>${formatDistanceKm(item.distanceKm, 3)}</td><td>${escapeHtml(item.household?.urgency ?? 'N/A')}</td><td>${escapeHtml(assignmentCompatibilityLabel(item))}</td></tr>`;
   }).join('');
-  const householdHeaders = (result.householdOrder || []).map((id, index) => `<th>${escapeHtml(id || `H* ${index + 1}`)}</th>`).join('');
-  return `<details class="technical-details"><summary>View Weighted Cost Matrix</summary><div class="table-wrap matrix-detail-wrap"><table class="compare-table matrix-detail-table"><thead><tr><th>Resource</th>${householdHeaders}</tr></thead><tbody>${rows}</tbody></table></div><p class="compare-note">The full weighted matrix is hidden by default because it is a technical validation artifact, not the primary presentation result.</p></details>`;
+  const rows = result.activeResources.map((resource, resourceIndex) => {
+    const resourceId = resource.resource_id || `R${resourceIndex + 1}`;
+    const values = householdOrder.map((_, householdIndex) => {
+      const value = result.costMatrix?.[resourceIndex]?.[householdIndex];
+      const formattedValue = isFiniteNumber(value) ? Number(value).toFixed(4) : 'N/A';
+      const isAssigned = assignmentCells.has(`${resourceIndex}:${householdIndex}`);
+      return `<td class="matrix-value-cell${isAssigned ? ' matrix-assigned-cell' : ''}" title="${escapeHtml(resourceId)} to ${escapeHtml(householdOrder[householdIndex] || `H* ${householdIndex + 1}`)}">${formattedValue}</td>`;
+    }).join('');
+    return `<tr><th class="matrix-row-header" scope="row">${escapeHtml(resourceId)}</th>${values}</tr>`;
+  }).join('');
+  const householdHeaders = householdOrder.map((id, index) => `<th class="matrix-column-header" scope="col">${escapeHtml(id || `H* ${index + 1}`)}</th>`).join('');
+  return `<details class="technical-details matrix-details"><summary>View Weighted Cost Matrix</summary><p class="matrix-explainer">Each row represents a relief resource and each column represents a household. Each cell shows the weighted assignment cost based on Distance, Urgency, and Compatibility. Lower values represent more desirable pairings because the Hungarian Algorithm minimizes total cost.</p><div class="matrix-summary-grid"><div><span>Matrix Size</span><strong>${matrixRows} &times; ${matrixColumns}</strong></div><div><span>Possible Pairings</span><strong>${possiblePairings.toLocaleString()}</strong></div><div><span>Objective</span><strong>Minimize Total Weighted Cost</strong></div><div><span>Criteria</span><strong>Distance ${Number(weights.distance).toFixed(3)}<br>Urgency ${Number(weights.urgency).toFixed(3)}<br>Compatibility ${Number(weights.compatibility).toFixed(3)}</strong></div></div><div class="matrix-legend" aria-label="Weighted cost matrix legend"><span><b>Row</b> Relief Resource</span><span><b>Column</b> Household</span><span><b>Cell Value</b> Weighted Assignment Cost</span><span><b>Lower Cost</b> Better Pairing</span><span><i class="matrix-legend-swatch"></i><b>Highlighted Cell</b> Selected Final Assignment</span></div><details class="matrix-help"><summary>How to Read This Matrix</summary><p><strong>Example:</strong><br>RES-SFP-011 &rarr; ABP-003 = 0.2059</p><p>This means assigning resource RES-SFP-011 to household ABP-003 has a weighted cost of 0.2059. The value combines normalized Distance, Urgency, and Compatibility criteria. Lower values are generally more desirable, but the Hungarian Algorithm evaluates the whole matrix to find the minimum total weighted cost one-to-one assignment overall.</p></details><details class="matrix-help"><summary>View Formula Details</summary><p><strong>Weighted Cost =</strong><br>${Number(weights.distance).toFixed(3)} &times; Normalized Distance<br>+ ${Number(weights.urgency).toFixed(3)} &times; Normalized Urgency Cost<br>+ ${Number(weights.compatibility).toFixed(3)} &times; Normalized Compatibility Cost</p></details><input class="matrix-view-toggle" id="matrix-selected-only-toggle" type="checkbox" checked><label class="matrix-toggle-label" for="matrix-selected-only-toggle">Show Selected Assignments Only</label><div class="matrix-selected-wrap" role="region" aria-label="Selected enhanced assignments"><table class="matrix-selected-table"><caption>Selected Final Assignments</caption><thead><tr><th>Resource</th><th>Assigned Household</th><th>Weighted Cost</th><th>Distance</th><th>Urgency</th><th>Compatibility</th></tr></thead><tbody>${selectedRows}</tbody></table></div><div class="matrix-detail-wrap" role="region" aria-label="Enhanced weighted cost matrix" tabindex="0"><table class="matrix-detail-table"><caption>Complete Weighted Cost Matrix (${matrixRows} &times; ${matrixColumns})</caption><thead><tr><th class="matrix-corner-header" scope="col">Resource / Household</th>${householdHeaders}</tr></thead><tbody>${rows}</tbody></table></div><p class="compare-note">The complete matrix is used internally by the Enhanced Hungarian Algorithm. The displayed highlights indicate the final one-to-one assignment selected by the optimization.</p></details>`;
 }
 
 function computeComparableWeightedCost(result, rows, activeResources) {
