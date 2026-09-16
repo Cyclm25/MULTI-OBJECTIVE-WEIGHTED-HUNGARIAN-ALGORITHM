@@ -11,9 +11,8 @@ const RESEARCH_WEIGHTS = Object.freeze({ distance: 0.164, urgency: 0.539, compat
 const BENCHMARK_MATRIX_SIZES = Object.freeze([10, 20, 30, 40, 50, 60]);
 const BENCHMARK_WARMUP_RUNS = 3;
 const BENCHMARK_REPETITIONS = 30;
-const HIGH_URGENCY_THRESHOLD = 7;
-const FOUR_POINT_HIGH_URGENCY_THRESHOLD = 3;
-const HUNDRED_POINT_HIGH_URGENCY_THRESHOLD = 70;
+const RESEARCH_URGENCY_MAX = 5;
+const HIGH_URGENCY_THRESHOLD = 4;
 function deriveAHPWeights() { return { ...RESEARCH_WEIGHTS }; }
 const DEBUG_ALGORITHM_DIAGNOSTICS = false;
 const IMPORT_FLOW_VERSION = 'resource-workbook-flow-20260907-map-fix';
@@ -197,11 +196,11 @@ function addResourceSourceMarkers(map, layers, resources = [], excludePoint = nu
 }
 function getUrgencyMeta(value) {
   const urgency = Number(value) || 0;
-  if (urgency >= 7) return { urgency, color: '#b55454', label: 'Immediate' };
+  if (urgency >= 5) return { urgency, color: '#b55454', label: 'Immediate' };
   if (urgency >= 4) return { urgency, color: '#c58a45', label: 'Priority' };
   return { urgency, color: '#59799d', label: 'Routine' };
 }
-const MAP_LEGEND = '<span class="map-legend-item"><i class="hub-dot"></i>Hub</span><span class="map-legend-item"><i class="immediate-dot"></i>Immediate (7–10)</span><span class="map-legend-item"><i class="priority-dot"></i>Priority (4–6)</span><span class="map-legend-item"><i class="routine-dot"></i>Routine (0–3)</span>';
+const MAP_LEGEND = '<span class="map-legend-item"><i class="hub-dot"></i>Hub</span><span class="map-legend-item"><i class="immediate-dot"></i>Immediate (5)</span><span class="map-legend-item"><i class="priority-dot"></i>Priority (4)</span><span class="map-legend-item"><i class="routine-dot"></i>Routine (1–3)</span>';
 const EXISTING_MAP_LEGEND = '<span class="map-legend-item"><i class="hub-dot"></i>Distribution Hub</span><span class="map-legend-item"><i class="household-dot"></i>Household</span><span class="map-legend-item"><i class="assignment-line"></i>Distance-based assignment</span><span class="map-legend-item"><i class="unassigned-dot"></i>Unassigned Household</span><span class="map-legend-item"><i class="pending-dot"></i>Pending Verification</span>';
 const RESOURCE_SOURCE_LEGEND_ITEM = '<span class="map-legend-item"><i class="resource-source-dot"></i>Resource source</span>';
 function getResearchAreaBounds() {
@@ -723,12 +722,8 @@ function buildDistanceMatrix(rows, activeResources) {
 }
 
 function getUrgencyPriorityScore(row, rows) {
-  const value = Number(row?.urgency);
-  if (!Number.isFinite(value)) return 0;
-  const urgencyValues = (rows || []).map(item => Number(item.urgency)).filter(Number.isFinite);
-  const maxUrgency = urgencyValues.length ? Math.max(...urgencyValues) : 10;
-  const denominator = maxUrgency <= 4 ? 4 : maxUrgency <= 10 ? 10 : 100;
-  return Math.max(0, Math.min(1, value / denominator));
+  assertResearchUrgencies([row]);
+  return parseUrgencyValue(row.urgency) / RESEARCH_URGENCY_MAX;
 }
 
 function buildExistingCostMatrix(rows, activeResources) {
@@ -741,6 +736,7 @@ function buildExistingCostMatrix(rows, activeResources) {
 }
 
 function buildEnhancedCostMatrix(rows, activeResources) {
+  assertResearchUrgencies(rows);
   const started = performance.now();
   const urgencyScores = rows.map(row => getUrgencyPriorityScore(row, rows));
   const urgencyPrepared = performance.now();
@@ -945,36 +941,41 @@ function computeComparableWeightedCost(result, rows, activeResources) {
 }
 
 function getUrgencyScaleMax(rows) {
-  const urgencyValues = (rows || []).map(row => Number(row.urgency)).filter(Number.isFinite);
-  const maxUrgency = urgencyValues.length ? Math.max(...urgencyValues) : 10;
-  return maxUrgency <= 4 ? 4 : maxUrgency <= 10 ? 10 : 100;
+  return RESEARCH_URGENCY_MAX;
 }
 
 function createDynamicUrgencyEvents(rows, count = 5) {
+  assertResearchUrgencies(rows);
   const candidates = (rows || [])
     .map((row, index) => ({ row, index, urgency: Number(row.urgency) }))
     .filter(item => Number.isFinite(item.urgency));
   if (!candidates.length) return [];
-  const maxUrgency = getUrgencyScaleMax(rows);
   const ordered = candidates.sort((a, b) => b.urgency - a.urgency || a.index - b.index);
+  const currentUrgencies = rows.map(row => Number(row.urgency));
   return Array.from({ length: count }, (_, eventIndex) => {
     const candidate = ordered[eventIndex % ordered.length];
-    const direction = candidate.urgency >= maxUrgency - 1 ? -1 : 1;
-    const newUrgency = Math.max(0, Math.min(maxUrgency, candidate.urgency + direction * 2));
+    const previousUrgency = currentUrgencies[candidate.index];
+    const eligible = [1, 2, 3, 4, 5].filter(value => Math.abs(value - previousUrgency) >= 2);
+    // Nearest eligible value, preferring the larger value on a tie.
+    eligible.sort((a, b) => Math.abs(a - previousUrgency) - Math.abs(b - previousUrgency) || b - a);
+    const newUrgency = eligible[0];
+    currentUrgencies[candidate.index] = newUrgency;
+    const delta = Math.abs(newUrgency - previousUrgency);
     return {
       eventNumber: eventIndex + 1,
       householdIndex: candidate.index,
-      previousUrgency: candidate.urgency,
+      previousUrgency,
       newUrgency,
-      delta: Math.abs(newUrgency - candidate.urgency),
-      triggered: Math.abs(newUrgency - candidate.urgency) >= 2
+      delta,
+      triggered: delta >= 2
     };
   });
 }
 
 function applyDynamicEventRows(rows, event) {
+  event = validateDynamicUrgencyEvent(rows, event);
   const updatedRows = rows.map(row => ({ ...row }));
-  if (event?.triggered && updatedRows[event.householdIndex]) {
+  if (updatedRows[event.householdIndex]) {
     updatedRows[event.householdIndex].urgency = event.newUrgency;
   }
   return updatedRows;
@@ -1052,6 +1053,7 @@ function refreshAssignmentHouseholds(output, rows) {
 }
 
 function selectiveEnhancedReassignment(currentResult, updatedRows, activeResources, affectedIndexes) {
+  assertResearchUrgencies(updatedRows);
   const started = performance.now();
   state.currentResources = activeResources;
   const currentOutput = (currentResult?.output || []).map(item => ({ ...item }));
@@ -1325,12 +1327,7 @@ function getAssignedCompatibilityScore(item) {
 }
 
 function getHighUrgencyThreshold(rows) {
-  const urgencyValues = (rows || []).map(row => Number(row.urgency)).filter(Number.isFinite);
-  if (!urgencyValues.length) return HIGH_URGENCY_THRESHOLD;
-  const maxUrgency = Math.max(...urgencyValues);
-  if (maxUrgency <= 4) return FOUR_POINT_HIGH_URGENCY_THRESHOLD;
-  if (maxUrgency <= 10) return HIGH_URGENCY_THRESHOLD;
-  return HUNDRED_POINT_HIGH_URGENCY_THRESHOLD;
+  return HIGH_URGENCY_THRESHOLD;
 }
 
 function calculateAssignmentMetrics(output, rows) {
@@ -1376,6 +1373,7 @@ function calculateAssignmentMetrics(output, rows) {
 }
 
 function runAssignment(mode, rows, activeResources) {
+  assertResearchUrgencies(rows);
   const started = performance.now();
   state.currentResources = activeResources;
   const preprocessingEnded = performance.now();
@@ -2143,8 +2141,14 @@ function runDynamicPerformanceBenchmarkSample(rows, activeResources, events) {
   const enhancedFullDynamicPhases = {};
   const enhancedSelectiveDynamicPhases = {};
   const eventLogs = [];
+  const pendingIndexes = new Set();
   events.forEach(event => {
+    event = validateDynamicUrgencyEvent(enhancedFullRows, event);
+    validateDynamicUrgencyEvent(enhancedSelectiveRows, event);
+    pendingIndexes.add(event.householdIndex);
     if (!event.triggered) {
+      enhancedFullRows = applyDynamicEventRows(enhancedFullRows, event);
+      enhancedSelectiveRows = applyDynamicEventRows(enhancedSelectiveRows, event);
       enhancedFullEventTimes.push(0);
       enhancedSelectiveEventTimes.push(0);
       eventLogs.push({ ...event, fullMs: 0, selectiveMs: 0, changed: false });
@@ -2154,7 +2158,8 @@ function runDynamicPerformanceBenchmarkSample(rows, activeResources, events) {
     enhancedFullRows = applyDynamicEventRows(enhancedFullRows, event);
     enhancedSelectiveRows = applyDynamicEventRows(enhancedSelectiveRows, event);
     currentFullEnhanced = runAssignment('enhanced', enhancedFullRows, activeResources);
-    currentSelectiveEnhanced = selectiveEnhancedReassignment(currentSelectiveEnhanced, enhancedSelectiveRows, activeResources, [event.householdIndex]);
+    currentSelectiveEnhanced = selectiveEnhancedReassignment(currentSelectiveEnhanced, enhancedSelectiveRows, activeResources, [...pendingIndexes]);
+    pendingIndexes.clear();
     const updatedAssignment = getResultAssignmentForRow(currentSelectiveEnhanced, enhancedSelectiveRows[event.householdIndex]);
     const validation = buildSelectiveValidation(currentFullEnhanced, currentSelectiveEnhanced);
     enhancedFullEventTimes.push(currentFullEnhanced.durationMs);
@@ -2405,7 +2410,7 @@ function renderReliefMap() {
     const point = [lat, lon];
     const { urgency, color, label } = getUrgencyMeta(row.urgency);
     const markerStyle = getDatasetMarkerStyle(row, color);
-    window.reliefLayers.push(L.circleMarker(point, markerStyle).addTo(window.reliefMap).bindPopup(`<strong>${escapeHtml(row.household_id || 'Household')}</strong><br>H*: ${escapeHtml(row.verification_status || 'Pending System Validation')}<br>Urgency: ${urgency}/10<br>Geocoding: ${escapeHtml(row.geocoding_status || 'Resolved')}<br>Location: ${escapeHtml(row.location_status || 'Pending Location Check')}`));
+    window.reliefLayers.push(L.circleMarker(point, markerStyle).addTo(window.reliefMap).bindPopup(`<strong>${escapeHtml(row.household_id || 'Household')}</strong><br>H*: ${escapeHtml(row.verification_status || 'Pending System Validation')}<br>Urgency: ${urgency}/5<br>Geocoding: ${escapeHtml(row.geocoding_status || 'Resolved')}<br>Location: ${escapeHtml(row.location_status || 'Pending Location Check')}`));
     mapped.push(point);
   });
   const eligible = state.validation ? getVerifiedHouseholdSet().length : 0;
@@ -2659,9 +2664,31 @@ function normalizeVerificationValue(value) {
 }
 
 function parseUrgencyValue(value) {
-  if (!hasDisplayValue(value)) return null;
+  if (typeof value !== 'number' && typeof value !== 'string') return null;
+  if (typeof value === 'string' && !value.trim()) return null;
   const urgency = Number(value);
-  return Number.isFinite(urgency) && urgency >= 0 && urgency <= 10 ? urgency : null;
+  return Number.isInteger(urgency) && urgency >= 1 && urgency <= RESEARCH_URGENCY_MAX ? urgency : null;
+}
+
+function assertResearchUrgencies(rows) {
+  rows.forEach((row, index) => {
+    if (parseUrgencyValue(row?.urgency) === null) {
+      throw new Error(`Invalid urgency for ${getHouseholdId(row) || `profile ${index + 1}`}: expected an integer from 1 through 5.`);
+    }
+  });
+}
+
+function validateDynamicUrgencyEvent(rows, event) {
+  assertResearchUrgencies(rows);
+  const row = rows[event?.householdIndex];
+  if (!row || parseUrgencyValue(event.previousUrgency) === null || parseUrgencyValue(event.newUrgency) === null) {
+    throw new Error('Invalid urgency event: before and after must be integers from 1 through 5.');
+  }
+  const previousUrgency = parseUrgencyValue(row.urgency);
+  if (previousUrgency !== Number(event.previousUrgency)) throw new Error('Invalid urgency event: previous urgency does not match the current profile.');
+  const newUrgency = parseUrgencyValue(event.newUrgency);
+  const delta = Math.abs(newUrgency - previousUrgency);
+  return { ...event, previousUrgency, newUrgency, delta, triggered: delta >= 2 };
 }
 
 function normalizeResourceRequirement(value) {
@@ -3072,7 +3099,7 @@ function validateHouseholdFields(row, duplicateIds) {
   const providedSomeCoordinates = hasDisplayValue(row.source_latitude) || hasDisplayValue(row.source_longitude);
   if (providedSomeCoordinates && !hasValidCoordinatePair(parseCoordinate(row.source_latitude), parseCoordinate(row.source_longitude))) addValidationReason(row, 'Invalid household coordinates');
   if (!hasDisplayValue(row.address) && !hasValidCoordinates(row)) addValidationReason(row, 'Missing address');
-  if (parseUrgencyValue(row.urgency) === null) addValidationReason(row, 'Invalid urgency value');
+  if (parseUrgencyValue(row.urgency) === null) addValidationReason(row, 'Invalid urgency: expected an integer from 1 through 5');
   if (hasDisplayValue(row.compatible_resource) && !isKnownResourceRequirement(row.compatible_resource)) addValidationReason(row, 'Unknown optional resource need');
   if (!hasDisplayValue(row.source_verification)) addValidationReason(row, 'Missing beneficiary verification status');
   if (hasDisplayValue(row.source_verification) && !['verified', 'pending', 'flagged', 'rejected'].includes(String(row.source_verification_status).toLowerCase())) addValidationReason(row, 'Unknown beneficiary verification status');
@@ -3314,7 +3341,7 @@ function getRunBlockers(mode, requestedCount = null) {
   }
   if (mode === 'enhanced') {
     const missingUrgency = hstar.filter(row => parseUrgencyValue(row.urgency) === null);
-    if (missingUrgency.length) blockers.push('Enhanced method cannot run because urgency data is missing or invalid');
+    if (missingUrgency.length) blockers.push('Enhanced method cannot run because urgency must be an integer from 1 through 5');
   }
   return blockers;
 }
@@ -3782,9 +3809,9 @@ function getExtraHouseholdInfo(row, usedFields) {
 }
 
 function getPriorityRangeLabel(meta) {
-  if (meta.urgency >= 7) return '7-10';
-  if (meta.urgency >= 4) return '4-6';
-  return '0-3';
+  if (meta.urgency >= 5) return '5';
+  if (meta.urgency >= 4) return '4';
+  return '1-3';
 }
 
 function renderHouseholdRows(details) {
@@ -3863,7 +3890,7 @@ function buildEnhancedHouseholdInfoHtml(item, hubDistance) {
   addHouseholdDetail(algorithmDetails, usedFields, 'Allocation', allocation);
   addHouseholdDetail(algorithmDetails, usedFields, 'Assignment status', assignmentStatus);
   if (urgencyMeta) {
-    addHouseholdDetail(algorithmDetails, usedFields, 'Urgency score', `${urgencyMeta.urgency}/10`);
+    addHouseholdDetail(algorithmDetails, usedFields, 'Urgency score', `${urgencyMeta.urgency}/5`);
     rememberField(usedFields, urgencyField);
     addHouseholdDetail(algorithmDetails, usedFields, 'Priority', `${urgencyMeta.label} (${getPriorityRangeLabel(urgencyMeta)})`);
   }

@@ -1,3 +1,4 @@
+# LEGACY Python prototype; not used by app.js or the official 1-5 research benchmark.
 """Comparative Performance Evaluation (Module 5)
 
 Solves SOP 3 / Objective 3: runs both standard and enhanced algorithms across sizes,
@@ -57,7 +58,7 @@ def run_once(n: int, seed: int = 0) -> Dict:
     # enhanced
     urgencies = [urgency_score(row) for _, row in Hstar.reset_index(drop=True).iterrows()]
     enhanced_res = run_dynamic_assignment(Hstar.reset_index(drop=True), resources.reset_index(drop=True), C,
-                                          urgency_series=urgencies, events=5, seed=seed)
+                                        urgency_series=urgencies, events=5, seed=seed)
     enh_map = enhanced_res["mapping"]
 
     # metrics

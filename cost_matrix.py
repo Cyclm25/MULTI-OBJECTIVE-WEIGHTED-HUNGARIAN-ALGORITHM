@@ -1,3 +1,4 @@
+# LEGACY Python prototype; not used by app.js or the official 1-5 research benchmark.
 """Multi-Objective Weighted Cost Matrix (Module 2)
 
 Solves SOP 1 / Objective 1: construct a composite weighted cost using

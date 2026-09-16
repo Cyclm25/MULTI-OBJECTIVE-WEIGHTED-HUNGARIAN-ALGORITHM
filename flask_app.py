@@ -1,3 +1,4 @@
+# LEGACY Python prototype; not used by app.js or the official 1-5 research benchmark.
 """Minimal Flask app to run simulations and display results (Module 6)
 """
 from flask import Flask, render_template_string, request, send_file

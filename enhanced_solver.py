@@ -1,3 +1,4 @@
+# LEGACY Python prototype; not used by app.js or the official 1-5 research benchmark.
 """Enhanced Multi-Objective Weighted Hungarian Algorithm + Dynamic Re-Assignment (Module 4)
 
 Solves SOP 2 / Objective 2: runs multi-objective assignment and performs selective
